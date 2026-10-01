@@ -6,6 +6,7 @@ Summerboard is an iOS-style tile springboard, gesture-based app launcher, and wi
 
 ## Technical Features
 ![Summerboard Demo](summerboardipadmini1.gif)
+* **Two Cortex A53 cores and 512 Megabytes of ram.** The demo you see is running natiely on a hacked ipad mini 1. see https://github.com/rzxvx/Project-Cascadia/tree/main
 * **Built for ARM SBCs:** Optimized with double-buffered shared memory (MIT-SHM) rendering and custom assembly-friendly blending algorithms.
 * **Spring Physics Engine:** Fluid, dynamic UI animations (scaling, workspace swiping, window transitions).
 * **Card-Based Multitasking:** iOS-style switcher with gesture support (swipe up to minimize, hold-and-drag to close processes).
