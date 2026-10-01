@@ -1,5 +1,5 @@
 # Summerboard
-
+![Summerboard Banner](summerboardbanner.jpeg)
 Summerboard is an iOS-style tile springboard, gesture-based app launcher, and window manager for X11 environments. Written in lightweight C and optimized for embedded single-board computers (SBCs), it features a custom software rasterizer, spring-based physics, smooth transitions, card-based multitasking, and built-in system panels.
 
 ---
