@@ -106,4 +106,4 @@ To utilize the full built-in utility set, ensure the following utilities are ava
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for details.
+GPL V3 License. See `LICENSE` for details.
