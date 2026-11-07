@@ -1,0 +1,16 @@
+# summerboard-softvol — Settings → Sound boost (digital gain above hardware 0 dB).
+pcm.sbboost {
+  type softvol
+  slave.pcm "dmix"
+  control {
+    name "Summerboard Boost"
+    card 0
+  }
+  min_dB -1.0
+  max_dB 9.0
+  resolution 51
+}
+pcm.!default {
+  type plug
+  slave.pcm "sbboost"
+}

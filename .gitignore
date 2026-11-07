@@ -1,0 +1,6 @@
+/summerboard
+*.o
+*.a
+*~
+.DS_Store
+/tmp/

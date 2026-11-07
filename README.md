@@ -1,110 +1,110 @@
 # Summerboard
+
 ![Summerboard Banner](summerboardbanner.jpeg)
+
+
 Summerboard is an iOS-style tile springboard, gesture-based app launcher, and window manager for X11 environments. Written in C and optimized for embedded single-board computers (SBCs), it features a custom software rasterizer, spring-based physics, smooth transitions, card-based multitasking, and built-in system panels.
 
 ---
 
-## Technical Features
+## Debian install (recommended)
+
+Turn a **bare Debian server with no desktop environment** into a Summerboard tablet session (Xorg + Mesa glamor, no display manager).
+
+**Requirements**
+
+* Debian 12/13 (bookworm/trixie) on x86_64 or aarch64
+* Working DRM/KMS GPU (`/dev/dri/card*`) — Intel/AMD/etc. via Mesa
+* Network + `sudo` for the desktop user
+* Roughly 200 MB free for packages and the WhiteSur icon theme
+
+**One-liner**
+
+```bash
+git clone https://github.com/teutekeune/summerboard.git
+cd summerboard && ./setup.sh && sudo reboot
+```
+
+`./setup.sh` will:
+
+1. Install Xorg, Mesa, modesetting/glamor deps, libinput, matchbox-keyboard, fonts, and build tools  
+2. Compile `summerboardv28_gl.c` against **Debian system Mesa**  
+3. Probe GPU `BusID` + `/dev/dri` and write `/etc/X11/xorg.conf.d/` (modesetting + glamor + DRI3, touchscreen)  
+4. Install `/usr/local/bin/summerboard`, `/usr/local/bin/rotate`, and assets under `~/summerboard`  
+5. Set `SUMMERBOARD_PRESENT=egl`, wire getty **autologin** on tty1 → `startx` → `.xinitrc`  
+6. Install matchbox-keyboard layouts **with a number row**
+
+After reboot you should land on the Summerboard home screen. No GDM/lightdm/sddm is installed or required.
+
+### Rebuild only
+
+```bash
+cc summerboardv28_gl.c -o summerboard \
+  -I/usr/include/freetype2 \
+  -lX11 -lXext -lXfixes -lEGL -lGL -lfreetype -lm
+sudo install -m 755 summerboard /usr/local/bin/summerboard
+sudo install -m 755 rotate /usr/local/bin/rotate
+```
+
+### Layout after setup
+
+| Path | Role |
+|------|------|
+| `/usr/local/bin/summerboard` | Binary |
+| `/usr/local/bin/rotate` | Autorotate / touch CTM helper |
+| `~/summerboard/` | `SUMMERBOARD_DIR` (icons, wallpaper, font, `keyboard.xml`) |
+| `~/.xinitrc` | Starts summerboard with `SUMMERBOARD_PRESENT=egl` |
+| `/etc/X11/xorg.conf.d/20-modesetting.conf` | GPU |
+| `/etc/X11/xorg.conf.d/40-libinput-touchscreen.conf` | Touch |
+
+---
+
+## Technical features
+
 ![Summerboard Demo](summerboardipadmini1.gif)
-* **Two Cortex A53 cores and 512 Megabytes of ram.** The demo you see is running natiely on a hacked ipad mini 1. see https://github.com/rzxvx/Project-Cascadia/tree/main
-* **Built for ARM SBCs:** Optimized with double-buffered shared memory (MIT-SHM) rendering and custom assembly-friendly blending algorithms.
-* **Spring Physics Engine:** Fluid, dynamic UI animations (scaling, workspace swiping, window transitions).
-* **Card-Based Multitasking:** iOS-style switcher with gesture support (swipe up to minimize, hold-and-drag to close processes).
-* **On-Screen Keyboard Integration:** Native support for `matchbox-keyboard`.
-* **Built-in Systems:** Integrated Wi-Fi configuration utility supporting real-time network scanning via `iw` and `wpa_supplicant`.
-* **Zero Heavy Dependencies:** Requires only standard X11 runtime libraries (`libX11`, `libXext`).
+
+* **Tablet-first X11 shell** with spring physics, workspace paging, and card multitasking  
+* **GPU path** via EGL/GL (set `SUMMERBOARD_PRESENT=egl`) on Mesa  
+* **On-screen keyboard** via `matchbox-keyboard` (number row included in this tree)  
+* **Autorotation** using IIO accelerometer + `rotate` (touch Coordinate Transformation Matrix)  
+* **Built-in Wi-Fi / sound panels** (`iw`/`wpa_supplicant`, ALSA softvol boost)
 
 ---
 
-## Hardware & Cross-Compilation Guide
+## Hardware & cross-compilation (Alpine / ARM SBCs)
 
-To build `summerboard` for `armhf` (ARMv6/v7) devices (such as Raspberry Pi, Cascadia-based rootfs, or Alpine Linux boards) from an `x86_64` host machine, use Docker with QEMU user emulation.
+For older software-rasterizer builds (`summerboard.c`) on Alpine ARM, Docker + QEMU still works:
 
-### Requirements
-* Docker installed on host machine
-* `qemu-user-static` enabled for multi-arch builds
-
-### Step-by-Step Build Steps
-
-1. **Enable QEMU Emulation (Host):**
-   ```bash
-   docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-   ```
-
-2. **Start the ARM32 Alpine Container:**
-   ```bash
-   docker run -it --rm --platform linux/arm/v6 -v $(pwd):/work -w /work arm32v6/alpine:latest sh
-   ```
-
-3. **Install Build Dependencies (Inside Container):**
-   ```bash
-   apk add --no-cache build-base xorg-server-dev libx11-dev
-   ```
-
-4. **Compile `summerboard`:**
-   ```bash
-   gcc -O3 -fno-math-errno -o summerboard summerboard.c -lX11 -lXext -lm -march=native
-   ```
-
-5. **Verify the Output Architecture:**
-   ```bash
-   file summerboard
-   # Should output: ELF 32-bit LSB executable, ARM, EABI5 version 1 (SYSV)...
-   ```
-
-6. **Exit Container:**
-   ```bash
-   exit
-   ```
-
----
-
-## Native Compilation (Directly on Target Device)
-
-If compiling directly on an ARM Linux target machine (Debian/Ubuntu/Alpine):
-
-### Alpine Linux
 ```bash
-sudo apk add build-base xorg-server-dev libx11-dev
+docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+docker run -it --rm --platform linux/arm/v6 -v $(pwd):/work -w /work arm32v6/alpine:latest sh
+apk add --no-cache build-base xorg-server-dev libx11-dev
 gcc -O3 -fno-math-errno -o summerboard summerboard.c -lX11 -lXext -lm
 ```
 
-### Ubuntu / Debian
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential libx11-dev libxext-dev
-gcc -O3 -fno-math-errno -o summerboard summerboard.c -lX11 -lXext -lm
-```
+Prefer the **Debian `setup.sh` + `summerboardv28_gl.c`** path above for convertibles and anything with a real GPU.
 
 ---
 
-## Usage & Execution
+## Gestures
 
-Run `summerboard` inside an active X11 display session:
-
-```bash
-./summerboard
-```
-
-### Key Bindings & Gestures
-* **App Grid Navigation:** Click/drag left or right to switch page grids.
-* **Open App:** Click any app icon.
-* **App Switcher / Recent Apps:** Drag up from the bottom edge of the screen.
-* **Close App:** Swipe up on an app card inside the task switcher view.
-* **Toggle Virtual Keyboard:** Tap the `Keyboard` app icon to toggle `matchbox-keyboard`.
+* **Open app** — tap icon  
+* **App switcher** — drag up from the bottom edge  
+* **Close app** — swipe up on a card in the switcher  
+* **Keyboard** — tap the Keyboard icon (toggle; does not autostart)  
+* **Pages** — drag left/right on the home grid  
 
 ---
 
-## Optional Runtime Dependencies
+## Optional runtime packages
 
-To utilize the full built-in utility set, ensure the following utilities are available on the target image:
-
-* `matchbox-keyboard` *(Virtual Keyboard support)*
-* `iw`, `wpa_supplicant`, `ip` *(Wi-Fi Control Panel)*
-* `xterm` *(Default fallback terminal)*
+* `matchbox-keyboard` — installed by `setup.sh`  
+* `iw`, `wpa_supplicant`, `ip` — Wi-Fi panel  
+* `xterm` — fallback terminal  
+* `alsa-utils` — volume / boost in Settings  
 
 ---
 
 ## License
 
-GPL V3 License. See `LICENSE` for details.
+GPL-3.0. See `LICENSE`.
