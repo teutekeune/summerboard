@@ -174,6 +174,18 @@ static double UI = 1.0;
 static pid_t kbd_pid = 0;
 static int kbd_active = 0;
 static Window kbd_win = None;
+/* matchbox-keyboard clamps landscape height to DisplayHeight/3. Some Alpine
+   builds also sticky-lock the first ConfigureNotify width. Our old ~0.35H band
+   was taller than H/3, so every ConfigureRequest fought the client — horizontal
+   jiggle + GPU thrash on slow EGL. Keep the OSK band at exactly H/3. */
+static int kbd_top_for(int h) {
+  int band = h / 3;
+  if (band < 1) band = 1;
+  return h - band;
+}
+static int kbd_top(void) { return kbd_top_for(H); }
+static int shell_band_h(void) { return kbd_active ? kbd_top() : H; }
+static int shell_band_h_for(int h) { return kbd_active ? kbd_top_for(h) : h; }
 /* Thin InputOnly strip always above clients so home-gesture hits work in fullscreen. */
 static Window gesture_lane = None;
 
@@ -527,8 +539,8 @@ static void toggle_matchbox_keyboard(void) {
   const char *target_disp = XDisplayString(dpy);
   if (!kbd_active) {
     kbd_active = 1;
-    int cur_h = (int)lround(H * 0.65);
-    XMoveResizeWindow(dpy, shell, 0, 0, W, cur_h);
+    XMoveResizeWindow(dpy, shell, 0, 0, W, shell_band_h());
+    gl_resize();
 
     kbd_pid = fork();
     if (kbd_pid == 0) {
@@ -547,6 +559,7 @@ static void toggle_matchbox_keyboard(void) {
       kbd_pid = 0;
     }
     XMoveResizeWindow(dpy, shell, 0, 0, W, H);
+    gl_resize();
   }
   layout_grid();
 }
@@ -1274,7 +1287,7 @@ static void scan_system_apps(void) {
 }
 
 static void layout_grid(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
 
   /* Narrow outer margin, wider column gaps. */
   double outer_pad = S(20);
@@ -1398,7 +1411,7 @@ static const double PHI = 1.618033988749895;
 #define CARD_R_PX S(32)
 
 static Rect full_rect(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   return (Rect){ 0, 0, W, eff_h, S(0) };
 }
 
@@ -1412,7 +1425,7 @@ static Rect icon_rect(const App *a) {
 }
 
 static void card_size(double *cw, double *ch) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   *cw = W / PHI;
   *ch = eff_h / PHI;
 }
@@ -1428,7 +1441,7 @@ static void switcher_metrics(double *cw, double *ch, double *left_margin, double
 static Rect card_render_box(int i) {
   double cw, ch, left_margin, max_scroll;
   switcher_metrics(&cw, &ch, &left_margin, &max_scroll);
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   double final_y = (eff_h - ch) / 2;
   if (switcher.entry.dur > 0) {
     double t = clampd((now_ms() - switcher.entry.t0) / switcher.entry.dur, 0, 1);
@@ -1465,7 +1478,7 @@ static Rect geom_pending_rect;
 static void sync_window_geometry_ex(App *a, Rect r, int force) {
   if (!a || a->nwin == 0) return;
 
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   if (r.h >= eff_h - 1) {
     r.h = eff_h - (int)lround(S(12));
   }
@@ -1714,7 +1727,7 @@ static void launch(App *a) {
 
   Rect target = full_rect();
   {
-    int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+    int eff_h = shell_band_h();
     target.h = eff_h - (int)lround(S(12));
   }
 
@@ -3341,7 +3354,7 @@ static void settings_paint(GImg *t, Rect r) {
 }
 
 static void settings_snapshot(App *a) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   if (!a->snap.fbo || a->snap.w != W || a->snap.h != eff_h) img_make_target(&a->snap, W, eff_h);
   img_clear(&a->snap);
   settings_draw(&a->snap, 0);
@@ -3607,7 +3620,7 @@ static void resume(App *a, Rect from_rect) {
 
   Rect target = full_rect();
   {
-    int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+    int eff_h = shell_band_h();
     target.h = eff_h - (int)lround(S(12));
   }
 
@@ -4033,7 +4046,7 @@ static void badge_geom(Rect ir, double *cx, double *cy, double *d) {
 typedef struct { Rect box; double x0, y0, cell_w, cell_h, icon; int cols; } PanelGeom;
 #define PANEL_MAX 20
 static void panel_geom(PanelGeom *g, int n) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   g->cols = 4;
   int rows = (n + g->cols - 1) / g->cols; if (rows < 1) rows = 1;
   double w = fmin(W - S(40), S(440));
@@ -4220,7 +4233,7 @@ static void compute_velocity(double *vx, double *vy) {
 }
 
 static int on_pointer_down(double x, double y) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
 
   if (kbd_active && y >= eff_h) {
     if (active_app && active_app->nwin > 0) {
@@ -4318,7 +4331,7 @@ static void on_pointer_move(double x, double y) {
   if (!gesture) return;
   record_touch(x, y);
   gesture->px = x; gesture->py = y;
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   if (!gesture->moved && hypot(x - gesture->start_x, y - gesture->start_y) > S(8)) gesture->moved = 1;
 
   if (strcmp(gesture->mode, "iconDrag") == 0) return;           /* drawn from the finger; drag_tick() reorders */
@@ -4409,7 +4422,7 @@ static void on_pointer_up(double x, double y) {
   }
   if (!gesture) return;
   double vx, vy; compute_velocity(&vx, &vy);
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
 
   if (strcmp(gesture->mode, "iconDrag") == 0) { end_drag(); return; }
   if (strcmp(gesture->mode, "editPress") == 0 || strcmp(gesture->mode, "doneTap") == 0 ||
@@ -4718,7 +4731,7 @@ static void draw_background(GImg *t, int eff_h) {
 }
 
 static void render_frame(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   GImg *t = &gl_screen;
   draw_background(t, eff_h);
 
@@ -4987,7 +5000,7 @@ static int window_is_trivial(Window w) {
 }
 
 static int app_normal_h(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  int eff_h = shell_band_h();
   return eff_h - (int)lround(S(12));
 }
 
@@ -5261,14 +5274,14 @@ static void on_map_request(XMapRequestEvent *e) {
 
   if (is_keyboard_window || (kbd_active && kbd_win == None)) {
     kbd_win = e->window;
-    int kbd_y = (int)lround(H * 0.65);
+    int kbd_y = kbd_top();
     int kbd_h = H - kbd_y;
 
     Atom wm_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
     Atom wm_type_input = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_INPUT_WINDOW", False);
     XChangeProperty(dpy, e->window, wm_type, XA_ATOM, 32, PropModeReplace, (unsigned char *)&wm_type_input, 1);
 
-    XMoveResizeWindow(dpy, e->window, 0, kbd_y, W, kbd_h);
+    XMoveResizeWindow(dpy, e->window, 0, kbd_y, (unsigned)W, (unsigned)kbd_h);
     XMapWindow(dpy, e->window);
     XRaiseWindow(dpy, e->window);
 
@@ -5429,11 +5442,37 @@ static void on_configure_request(XConfigureRequestEvent *e) {
 
   int raised_lane = 0;
   if (e->window == kbd_win) {
+    int y = kbd_top();
+    int hh = H - y;
+    Window rr; int cx, cy; unsigned cw, ch, bd, dp;
+    if (XGetGeometry(dpy, e->window, &rr, &cx, &cy, &cw, &ch, &bd, &dp) &&
+        cx == 0 && cy == y && (int)cw == W && (int)ch == hh) {
+      /* Already docked. Synthetic ConfigureNotify (ICCCM) — do NOT call
+         XConfigureWindow again or matchbox re-enters resize and jiggles. */
+      XEvent ce;
+      memset(&ce, 0, sizeof ce);
+      ce.xconfigure.type = ConfigureNotify;
+      ce.xconfigure.display = dpy;
+      ce.xconfigure.event = e->window;
+      ce.xconfigure.window = e->window;
+      ce.xconfigure.x = 0;
+      ce.xconfigure.y = y;
+      ce.xconfigure.width = W;
+      ce.xconfigure.height = hh;
+      ce.xconfigure.border_width = 0;
+      ce.xconfigure.above = None;
+      ce.xconfigure.override_redirect = False;
+      XSendEvent(dpy, e->window, False, StructureNotifyMask, &ce);
+      return;
+    }
     wc.x = 0;
-    wc.y = (int)lround(H * 0.65);
+    wc.y = y;
     wc.width = W;
-    wc.height = H - wc.y;
+    wc.height = hh;
     mask |= CWX | CWY | CWWidth | CWHeight;
+    mask &= ~(CWSibling | CWStackMode);
+    XConfigureWindow(dpy, e->window, mask, &wc);
+    return;   /* never shell_raise_home on every OSK configure */
   } else {
     App *a = find_app_by_win(e->window);
     if (!a) a = find_app_by_pid(window_pid(e->window));
@@ -5455,7 +5494,7 @@ static void on_configure_request(XConfigureRequestEvent *e) {
 
   XConfigureWindow(dpy, e->window, mask, &wc);
   if (raised_lane) gesture_lane_raise();
-  if (!active_app || e->window == kbd_win) shell_raise_home();
+  if (!active_app) shell_raise_home();
 }
 
 static void on_unmap_notify(XUnmapEvent *e) {
@@ -5557,7 +5596,7 @@ static int shell_size(int *ow, int *oh) {
    force=1 also runs when W/H already match but the shell X window does not. */
 static void screen_resized_ex(int nw, int nh, int force) {
   if (nw <= 0 || nh <= 0) return;
-  int eff_h = kbd_active ? (int)lround(nh * 0.65) : nh;
+  int eff_h = shell_band_h_for(nh);
   int sw = 0, sh = 0, shell_ok = shell_size(&sw, &sh) && sw == nw && sh == eff_h;
   if (!force && nw == W && nh == H && shell_ok) return;
 
@@ -5567,7 +5606,7 @@ static void screen_resized_ex(int nw, int nh, int force) {
   W = nw; H = nh;
   /* Same formula as startup so icon/font scale stays sane across portrait/landscape. */
   UI = fmax(1.0, fmin((double)fmax(W, H) / 1024.0, (double)fmin(W, H) / 768.0));
-  eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  eff_h = shell_band_h();
 
   /* Unmap during resize so Mesa/EGL cannot keep a stale landscape surface mapped. */
   XUnmapWindow(dpy, shell);
@@ -5619,12 +5658,35 @@ static void screen_resized(int nw, int nh) { screen_resized_ex(nw, nh, 0); }
 static int screen_size_poll(void) {
   int nw = 0, nh = 0;
   if (!root_size(&nw, &nh)) return 0;
-  int eff_h = kbd_active ? (int)lround(nh * 0.65) : nh;
+  if (nw != W || nh != H) {
+    screen_resized_ex(nw, nh, 0);
+    return 1;
+  }
+  /* Root unchanged: never run the full Unmap/egl_recreate rotation path just
+     because the shell is in the keyboard band — that thrashed Alpine/SGX. */
+  int want = shell_band_h();
   int sw = 0, sh = 0;
-  int shell_bad = !shell_size(&sw, &sh) || sw != nw || sh != eff_h;
-  if (nw == W && nh == H && !shell_bad) return 0;
-  screen_resized_ex(nw, nh, shell_bad);
-  return 1;
+  if (!shell_size(&sw, &sh) || sw != W || sh != want) {
+    XMoveResizeWindow(dpy, shell, 0, 0, (unsigned)W, (unsigned)want);
+    if (kbd_win != None) {
+      int y = kbd_top();
+      XMoveResizeWindow(dpy, kbd_win, 0, y, (unsigned)W, (unsigned)(H - y));
+    }
+    gl_resize();
+    layout_grid();
+    return 1;
+  }
+  if (kbd_win != None) {
+    int y = kbd_top();
+    int hh = H - y;
+    Window rr; int x, wy; unsigned ww, wh, b, d;
+    if (!XGetGeometry(dpy, kbd_win, &rr, &x, &wy, &ww, &wh, &b, &d) ||
+        x != 0 || wy != y || (int)ww != W || (int)wh != hh) {
+      XMoveResizeWindow(dpy, kbd_win, 0, y, (unsigned)W, (unsigned)hh);
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -5828,7 +5890,7 @@ int main(int argc, char **argv) {
     drag_tick(now);
     finalize_removals();
 
-    int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+    int eff_h = shell_band_h();
     if (gesture && strcmp(gesture->mode, "drag") == 0 && !gesture->hold_fired
         && gesture->py < eff_h * 0.85
         && (now - gesture->last_move_t) > (active_app ? 450.0 : 60.0)) {
