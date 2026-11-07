@@ -3451,13 +3451,6 @@ static void settings_dispatch(int id, int arg) {
   }
 }
 
-static void settings_pointer_down(double x, double y) {
-  st.press_id = 0; st.dragging = 0; st.press_x = x; st.press_y = y;
-  st.press_scroll = st.scroll.x; st.scroll.target = st.scroll.x; st.scroll.v = 0;
-  const Hit *h = hit_at(x, y);
-  if (h) { st.press_id = h->id; st.press_arg = h->arg; }
-}
-
 static void sound_slider_at(int which, double x) {
   double tx = which == H_VOL_SLIDER ? st.vol_track_x : st.boost_track_x;
   double tw = which == H_VOL_SLIDER ? st.vol_track_w : st.boost_track_w;
@@ -3465,6 +3458,16 @@ static void sound_slider_at(int which, double x) {
   int pct = (int)lround(clampd((x - tx) / tw, 0, 1) * 100.0);
   if (which == H_VOL_SLIDER) sound_apply_volume(pct);
   else sound_apply_boost(pct);
+}
+
+static void settings_pointer_down(double x, double y) {
+  st.press_id = 0; st.dragging = 0; st.press_x = x; st.press_y = y;
+  st.press_scroll = st.scroll.x; st.scroll.target = st.scroll.x; st.scroll.v = 0;
+  const Hit *h = hit_at(x, y);
+  if (h) {
+    st.press_id = h->id; st.press_arg = h->arg;
+    if (h->id == H_VOL_SLIDER || h->id == H_BOOST_SLIDER) sound_slider_at(h->id, x);
+  }
 }
 
 static void settings_pointer_move(double x, double y) {
