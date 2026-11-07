@@ -5320,6 +5320,14 @@ static void on_map_request(XMapRequestEvent *e) {
   if (rs_busy(&win_spring) || gesture || (active_app == a && a->covered)) {
     app_add_win(a, e->window);
     a->covered = 1;
+    /* Never map InputOnly / opacity-0 during the open flight — WebKitGTK's
+       WebKitWebProcess InputOnly would sit above Badwolf after uncover and
+       eat every touch. Track only; reveal path filters them in app_raise. */
+    if (window_is_input_only(e->window) || window_opacity_is_zero(e->window)) {
+      XUnmapWindow(dpy, e->window);
+      shell_raise_home();
+      return;
+    }
     XSetWindowBorderWidth(dpy, e->window, 0);
     XMoveResizeWindow(dpy, e->window, 0, 0, W, (unsigned)app_normal_h());
     /* Map under the shell so Chromium keeps a live buffer; shell stays on top. */
@@ -5386,16 +5394,24 @@ static void on_map_notify(XMapEvent *e) {
   shell_raise_home();
 }
 
-/* True if this client may sit above the shell right now. */
+/* True if this client may sit above the shell right now.
+   Large InputOnly / opacity-0 top-levels never may — WebKitGTK's
+   WebKitWebProcess maps a full-screen InputOnly that steals all touches
+   after Badwolf close/reopen if we treat it like a normal FG window. */
 static int client_may_show(App *a, Window w) {
-  (void)w;
-  return a && active_app == a && a->state == ST_FG && !a->covered
-      && !switcher.open && !gesture && !rs_busy(&win_spring);
+  if (!a || active_app != a || a->state != ST_FG || a->covered) return 0;
+  if (switcher.open || gesture || rs_busy(&win_spring)) return 0;
+  if (w != None && (window_is_input_only(w) || window_opacity_is_zero(w))) return 0;
+  return 1;
 }
 
 /* Covered FG app: stay mapped under the shell (content preserved). */
-static int client_cover_hold(App *a) {
-  return a && active_app == a && a->state == ST_FG && a->covered;
+static int client_cover_hold(App *a, Window w) {
+  if (!(a && active_app == a && a->state == ST_FG && a->covered)) return 0;
+  /* InputOnly / opacity-0 must not ride along under the shell either —
+     uncover would raise them and Badwolf loses touch again. */
+  if (w != None && (window_is_input_only(w) || window_opacity_is_zero(w))) return 0;
+  return 1;
 }
 
 /* Unmap every root child that should not cover home / the FG app. Brave remaps
@@ -5412,8 +5428,17 @@ static void home_enforce_stacking(void) {
       if (!a) a = find_app_by_pid(window_pid(w));
       if (!a) a = find_app_by_class(w);
       if (a) app_add_win(a, w);
+      /* Always bury InputOnly / opacity-0 traps (Badwolf/WebKit, Chromium). */
+      if (window_is_input_only(w) || window_opacity_is_zero(w)) {
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(dpy, w, &wa) && wa.map_state != IsUnmapped) {
+          XUnmapWindow(dpy, w);
+          hid = 1;
+        }
+        continue;
+      }
       if (client_may_show(a, w)) continue;
-      if (client_cover_hold(a)) {
+      if (client_cover_hold(a, w)) {
         XLowerWindow(dpy, w);                /* keep buffers alive during swipe */
         continue;
       }
@@ -5425,6 +5450,8 @@ static void home_enforce_stacking(void) {
     }
     XFree(kids);
   }
+  if (active_app && !active_app->builtin && !active_app->covered)
+    app_hide_invisible_overlays(active_app);
   if (!active_app || hid || (active_app && active_app->covered)) shell_raise_home();
   else if (active_app) gesture_lane_raise();
 }
