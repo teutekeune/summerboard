@@ -71,13 +71,15 @@
 #define SNAPSHOT_ICONS 1
 
 #define MAX_APPS 64
-#define MAX_WINS 6
+#define MAX_WINS 32          /* Chromium/Brave opens many helper windows */
 #define NGRID 16
 #define NGLYPH 96
 
-#define GRID_COLS 4
-#define GRID_ROWS 5
-#define APPS_PER_PAGE (GRID_COLS * GRID_ROWS)
+/* Home icon grid swaps with orientation (same 20 slots/page either way). */
+#define GRID_COLS_LANDSCAPE 5
+#define GRID_ROWS_LANDSCAPE 4
+#define GRID_COLS_PORTRAIT  4
+#define GRID_ROWS_PORTRAIT  5
 
 enum { ST_CLOSED, ST_FG, ST_BG };
 
@@ -172,6 +174,15 @@ static double UI = 1.0;
 static pid_t kbd_pid = 0;
 static int kbd_active = 0;
 static Window kbd_win = None;
+/* Thin InputOnly strip always above clients so home-gesture hits work in fullscreen. */
+static Window gesture_lane = None;
+
+/* EWMH fullscreen / active-window (Chromium, Brave, and most FS apps). */
+static Atom atom_net_supported;
+static Atom atom_net_wm_state;
+static Atom atom_net_wm_state_fullscreen;
+static Atom atom_net_active_window;
+static Atom atom_net_wm_window_opacity;
 
 /* Renderer: RR, rr_make, mix32, GImg, Glyph/AppFont, glyph_index, utf8_next, text_width,
    batch + primitives (fill_rr, fill_rect, ui_seg, draw_text, img_draw, draw_rgba,
@@ -416,6 +427,7 @@ struct App {
   int covered;            /* real window is unmapped/withheld while the shell animates its snapshot */
   unsigned snap_gen;
   char iconname[160];     /* icon name hints (comma separated): .desktop Icon= or built-in defaults */
+  char wm_class[64];      /* StartupWMClass from .desktop (Brave → brave-browser) */
   char theme_path[512];   /* resolved WhiteSur svg ("" = not looked up yet) */
   GImg themeimg;          /* rasterised WhiteSur icon, premultiplied, icon-sized */
   int theme_state;        /* 0 = untried, 1 = ok, -1 = no theme icon for this app */
@@ -446,12 +458,39 @@ static int add_panel_open = 0;
 static Spring edit_spring, panel_spring;  /* 0..1 visual state of edit mode / the "add" panel */
 static RectSpring dock_spring;            /* the dock plate eases when its width changes */
 static int dock_spring_ready = 0;
-typedef struct { double left, icon_w, gap, row_gap, top; int cols; } GridMetrics;
+typedef struct { double left, icon_w, gap, row_gap, top; int cols, rows; } GridMetrics;
 static GridMetrics gm;                    /* filled in by layout_grid, used to map a finger to a slot */
+
+/* Landscape (W>=H): more columns. Portrait: more rows. Updated whenever layout_grid runs. */
+static int grid_cols_for(int w, int h) {
+  return (w >= h) ? GRID_COLS_LANDSCAPE : GRID_COLS_PORTRAIT;
+}
+static int grid_rows_for(int w, int h) {
+  return (w >= h) ? GRID_ROWS_LANDSCAPE : GRID_ROWS_PORTRAIT;
+}
 static void exit_edit_mode(void);
 
 static void layout_grid(void);
 static int ensure_theme_icon(App *a);
+static App *find_app_by_win(Window w);
+static App *find_app_by_pid(pid_t pid);
+static App *find_app_by_class(Window w);
+static pid_t window_pid(Window w);
+static void shell_raise_home(void);
+static void home_enforce_stacking(void);
+static int window_is_trivial(Window w);
+static int window_has_fullscreen_state(Window w);
+static int window_looks_fullscreen(Window w);
+static int window_opacity_is_zero(Window w);
+static int window_is_input_only(Window w);
+static void window_apply_fullscreen(Window w, int on);
+static void app_exit_fullscreen(App *a);
+static void app_hide_invisible_overlays(App *a);
+static Window app_best_content_win(App *a);
+static int app_normal_h(void);
+static int client_may_show(App *a, Window w);
+static void gesture_lane_ensure(void);
+static void gesture_lane_raise(void);
 
 static unsigned snap_serial = 1;
 static void snap_drop(App *a) { img_free(&a->snap); a->snap_gen = ++snap_serial; }
@@ -469,17 +508,33 @@ static int wm_error_handler(Display *d, XErrorEvent *e) {
   return 0;
 }
 
+/* Prefer Summerboard's number-row layout, then ~/.matchbox/keyboard.xml. */
+static void matchbox_keyboard_env(void) {
+  static char cfg[512];
+  const char *dir = getenv("SUMMERBOARD_DIR");
+  const char *home = getenv("HOME");
+  if (dir && dir[0]) {
+    snprintf(cfg, sizeof cfg, "%s/keyboard.xml", dir);
+    if (access(cfg, R_OK) == 0) { setenv("MB_KBD_CONFIG", cfg, 1); return; }
+  }
+  if (home && home[0]) {
+    snprintf(cfg, sizeof cfg, "%s/.matchbox/keyboard.xml", home);
+    if (access(cfg, R_OK) == 0) { setenv("MB_KBD_CONFIG", cfg, 1); return; }
+  }
+}
+
 static void toggle_matchbox_keyboard(void) {
   const char *target_disp = XDisplayString(dpy);
   if (!kbd_active) {
     kbd_active = 1;
-    int cur_h = (int)lround(H * 0.75);
+    int cur_h = (int)lround(H * 0.65);
     XMoveResizeWindow(dpy, shell, 0, 0, W, cur_h);
 
     kbd_pid = fork();
     if (kbd_pid == 0) {
       setsid();
       setenv("DISPLAY", target_disp, 1);
+      matchbox_keyboard_env();
       execlp("matchbox-keyboard", "matchbox-keyboard", NULL);
       _exit(127);
     }
@@ -593,11 +648,14 @@ static void rot_mount_matrix(const char *dev, int m[9]) {
 /* x right, y up (away from Home), z out of the glass. Lying flat (under half of the pull in the glass's plane)
    says nothing; otherwise the larger of x and y, when the other is under 2/3 of it (34 degrees off the axis, so
    a diagonal does not flicker). */
+/* HP Stream x360 (HID accel_3d): gravity +X => portrait with hinge on the
+   right when upright (user GT: 90° CW physical). xrandr "left" is upright
+   there; the stock Alpine mapping had left/right (and normal/inverted) swapped. */
 static const char *rot_classify(long X, long Y, long Z) {
   long ax = labs(X), ay = labs(Y);
   if (4 * (X * X + Y * Y) < X * X + Y * Y + Z * Z) return NULL;
-  if (3 * ax < 2 * ay) return Y > 0 ? "normal" : "inverted";
-  if (3 * ay < 2 * ax) return X < 0 ? "left" : "right";
+  if (3 * ax < 2 * ay) return Y > 0 ? "inverted" : "normal";
+  if (3 * ay < 2 * ax) return X < 0 ? "right" : "left";
   return NULL;
 }
 
@@ -636,7 +694,7 @@ static int rot_xpid(pid_t *out) {
 
 /* One autorotate per X server, the same pid file the script uses. A stale file (dead pid) is replaced. */
 static int rot_claim(pid_t xpid) {
-  snprintf(rot_pidf, sizeof rot_pidf, "/run/autorotate-%ld.pid", (long)xpid);
+  snprintf(rot_pidf, sizeof rot_pidf, "/tmp/autorotate-%ld.pid", (long)xpid);
   FILE *f = fopen(rot_pidf, "r");
   if (f) {
     long p = 0;
@@ -689,9 +747,16 @@ static void autorotate_child(pid_t parent) {
   signal(SIGHUP, rot_die);
   if (!rot_claim(xpid)) _exit(0);
 
-  snprintf(path, sizeof path, "%s/sampling_frequency", dev);
-  { FILE *f = fopen(path, "w"); if (f) { fputs("100\n", f); fclose(f); }
-    else fprintf(stderr, "autorotate: cannot set %s; reads will be slow\n", path); }
+  {
+    const char *sf[] = { "in_accel_sampling_frequency", "sampling_frequency" };
+    int ok = 0;
+    for (int i = 0; i < 2 && !ok; i++) {
+      snprintf(path, sizeof path, "%s/%s", dev, sf[i]);
+      FILE *f = fopen(path, "w");
+      if (f) { fputs("100\n", f); fclose(f); ok = 1; }
+    }
+    if (!ok) fprintf(stderr, "autorotate: cannot set accel sampling_frequency; reads will be slow\n");
+  }
 
   int m[9];
   rot_mount_matrix(dev, m);
@@ -717,10 +782,18 @@ static void autorotate_child(pid_t parent) {
     long Z = (m[6] * x + m[7] * y + m[8] * z) / 16;
     const char *o = rot_classify(X, Y, Z);
     if (o && strcmp(o, last) == 0 && strcmp(o, seen) != 0) {   /* the same twice running */
-      seen = o;
       if (!locked) {
         char cur[64];
-        if (!rot_current(cur, sizeof cur) || strcmp(cur, o) != 0) rot_apply(o);
+        if (!rot_current(cur, sizeof cur) || strcmp(cur, o) != 0) {
+          rot_apply(o);
+          /* Only remember success: a failed/busy rotate must be retried. */
+          if (rot_current(cur, sizeof cur) && strcmp(cur, o) == 0) seen = o;
+          else fprintf(stderr, "autorotate: apply %s failed (still %s)\n", o, cur[0] ? cur : "?");
+        } else {
+          seen = o;
+        }
+      } else {
+        seen = o;                           /* locked: remember so we do not spam */
       }
     }
     last = o ? o : "";
@@ -737,6 +810,91 @@ static void autorotate_start(void) {
   pid_t pid = fork();
   if (pid == 0) autorotate_child(parent);
   if (pid < 0) fprintf(stderr, "summerboard: cannot start autorotate: %s\n", strerror(errno));
+}
+
+/* ------------------------------------------------------------------------ */
+/* Gyroscope / IIO orientation sensors                                      */
+/* ------------------------------------------------------------------------ */
+/* HP Stream x360 exposes HID sensor hub IIO nodes: accel_3d, gyro_3d, magn_3d,
+   incli_3d, and a rotation quaternion. Autorotate already uses in_accel_*_raw.
+   There was no gyro hook; probe and keep paths so callers can read angular velocity. */
+static char gyro_dev[300];
+static char accel_dev_path[300];
+static int gyro_present;
+static int accel_present;
+
+static int iio_find_channel(const char *needle_file, char *out, size_t nout) {
+  out[0] = 0;
+  glob_t g;
+  if (glob("/sys/bus/iio/devices/iio:device*", 0, NULL, &g) != 0) return 0;
+  char path[400];
+  for (size_t i = 0; i < g.gl_pathc; i++) {
+    snprintf(path, sizeof path, "%s/%s", g.gl_pathv[i], needle_file);
+    if (access(path, R_OK) == 0) {
+      snprintf(out, nout, "%s", g.gl_pathv[i]);
+      globfree(&g);
+      return 1;
+    }
+  }
+  globfree(&g);
+  return 0;
+}
+
+static void iio_read_name(const char *dev, char *out, size_t n) {
+  out[0] = 0;
+  if (!dev || !dev[0]) return;
+  char path[400];
+  snprintf(path, sizeof path, "%s/name", dev);
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  if (fgets(out, (int)n, f)) out[strcspn(out, "\r\n")] = 0;
+  fclose(f);
+}
+
+/* Returns 1 if a gyroscope (in_anglvel_*) was found. Fills gyro_dev. */
+static int gyro_probe(void) {
+  gyro_present = iio_find_channel("in_anglvel_x_raw", gyro_dev, sizeof gyro_dev);
+  accel_present = iio_find_channel("in_accel_x_raw", accel_dev_path, sizeof accel_dev_path);
+  char gname[128] = "", aname[128] = "", qname[128] = "", mname[128] = "";
+  char quat[300] = "", magn[300] = "";
+  iio_read_name(gyro_dev, gname, sizeof gname);
+  iio_read_name(accel_dev_path, aname, sizeof aname);
+  if (iio_find_channel("in_rot_quaternion_raw", quat, sizeof quat)) iio_read_name(quat, qname, sizeof qname);
+  if (iio_find_channel("in_magn_x_raw", magn, sizeof magn)) iio_read_name(magn, mname, sizeof mname);
+
+  if (gyro_present) {
+    long x = 0, y = 0, z = 0;
+    char px[400], py[400], pz[400];
+    snprintf(px, sizeof px, "%s/in_anglvel_x_raw", gyro_dev);
+    snprintf(py, sizeof py, "%s/in_anglvel_y_raw", gyro_dev);
+    snprintf(pz, sizeof pz, "%s/in_anglvel_z_raw", gyro_dev);
+    rot_read_long(px, &x); rot_read_long(py, &y); rot_read_long(pz, &z);
+    fprintf(stderr, "summerboard: gyroscope detected (%s name=%s) raw xyz=%ld,%ld,%ld\n",
+            gyro_dev, gname[0] ? gname : "?", x, y, z);
+  } else {
+    fprintf(stderr, "summerboard: no gyroscope (no IIO device with in_anglvel_x_raw)\n");
+  }
+  if (accel_present)
+    fprintf(stderr, "summerboard: accelerometer (%s name=%s)\n", accel_dev_path, aname[0] ? aname : "?");
+  if (qname[0]) fprintf(stderr, "summerboard: orientation quaternion (%s name=%s)\n", quat, qname);
+  if (mname[0]) fprintf(stderr, "summerboard: magnetometer (%s name=%s)\n", magn, mname);
+  return gyro_present;
+}
+
+/* Read gyroscope angular velocity raw samples. Returns 1 on success. */
+static int gyro_read_raw(long *x, long *y, long *z) {
+  if (!gyro_present || !gyro_dev[0]) return 0;
+  char px[400], py[400], pz[400];
+  snprintf(px, sizeof px, "%s/in_anglvel_x_raw", gyro_dev);
+  snprintf(py, sizeof py, "%s/in_anglvel_y_raw", gyro_dev);
+  snprintf(pz, sizeof pz, "%s/in_anglvel_z_raw", gyro_dev);
+  return rot_read_long(px, x) && rot_read_long(py, y) && rot_read_long(pz, z);
+}
+
+/* Quiet unused-function warning when nothing else calls the reader yet. */
+static void gyro_warmup(void) {
+  long x, y, z;
+  (void)gyro_read_raw(&x, &y, &z);
 }
 
 static int is_executable(const char *cmd) {
@@ -968,7 +1126,8 @@ static void app_init_springs(App *a) {
   sp_init(&a->oy, 0, 260, 26, 0.05);
 }
 
-static void add_app_icon(const char *name, const char *cmd, int is_kbd, const char *icon) {
+static void add_app_icon_ex(const char *name, const char *cmd, int is_kbd,
+                            const char *icon, const char *wm_class) {
   if (app_count >= MAX_APPS) return;
   if (!is_kbd && !is_executable(cmd)) return;
 
@@ -977,6 +1136,7 @@ static void add_app_icon(const char *name, const char *cmd, int is_kbd, const ch
   }
 
   App *a = &apps[app_count];
+  memset(a, 0, sizeof(*a));
   a->id = app_count;
   strncpy(a->name, name, sizeof(a->name) - 1);
   strncpy(a->cmd, cmd, sizeof(a->cmd) - 1);
@@ -985,9 +1145,14 @@ static void add_app_icon(const char *name, const char *cmd, int is_kbd, const ch
   a->is_dock = (app_count < 6);
   a->is_kbd = is_kbd;
   if (icon) snprintf(a->iconname, sizeof a->iconname, "%s", icon);
+  if (wm_class && wm_class[0]) snprintf(a->wm_class, sizeof a->wm_class, "%s", wm_class);
   app_init_springs(a);
 
   app_count++;
+}
+
+static void add_app_icon(const char *name, const char *cmd, int is_kbd, const char *icon) {
+  add_app_icon_ex(name, cmd, is_kbd, icon, NULL);
 }
 
 static void add_app_manual(const char *name, const char *cmd, int is_kbd) { add_app_icon(name, cmd, is_kbd, NULL); }
@@ -1018,6 +1183,7 @@ static void parse_desktop_file(const char *filepath) {
   char name[64] = "";
   char exec[256] = "";
   char icon[160] = "";
+  char wm_class[64] = "";
   int no_display = 0;
   int in_desktop_entry = 0;
 
@@ -1037,6 +1203,8 @@ static void parse_desktop_file(const char *filepath) {
       if (p) *p = '\0';
     } else if (strncmp(line, "Icon=", 5) == 0 && icon[0] == '\0') {
       sscanf(line + 5, "%159[^\n]", icon);
+    } else if (strncmp(line, "StartupWMClass=", 15) == 0 && wm_class[0] == '\0') {
+      sscanf(line + 15, "%63[^\n]", wm_class);
     } else if (strncmp(line, "NoDisplay=true", 14) == 0) {
       no_display = 1;
     }
@@ -1046,7 +1214,7 @@ static void parse_desktop_file(const char *filepath) {
   if (no_display || name[0] == '\0' || exec[0] == '\0') return;
   if (strstr(exec, "matchbox-keyboard")) return;   /* opened with the home button instead of an icon */
 
-  add_app_icon(name, exec, 0, icon);
+  add_app_icon_ex(name, exec, 0, icon, wm_class);
 }
 
 static void scan_dir(const char *dirpath) {
@@ -1066,6 +1234,9 @@ static void scan_dir(const char *dirpath) {
 
 static void scan_system_apps(void) {
   add_builtin_app("Settings", 0x8E8E93);
+
+  /* Toggleable on-screen keyboard (not a normal app window). Tap again / while open to dismiss. */
+  add_app_icon("Keyboard", "matchbox-keyboard", 1, "input-keyboard,keyboard,onboard,matchbox-keyboard");
 
   scan_dir("/usr/share/applications");
   scan_dir("/usr/local/share/applications");
@@ -1103,11 +1274,17 @@ static void scan_system_apps(void) {
 }
 
 static void layout_grid(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
 
   /* Narrow outer margin, wider column gaps. */
   double outer_pad = S(20);
-  int cols = GRID_COLS;
+  int cols = grid_cols_for(W, H);
+  int rows = grid_rows_for(W, H);
+  int per_page = cols * rows;
+  if (cols != gm.cols || rows != gm.rows) {
+    fprintf(stderr, "summerboard: home grid %dx%d (%s, screen %dx%d)\n",
+            cols, rows, (W >= H) ? "landscape" : "portrait", W, H);
+  }
 
   double gap = (W - (outer_pad * 2)) * 0.10;
   if (gap < S(24)) gap = S(24);
@@ -1116,8 +1293,8 @@ static void layout_grid(void) {
   double icon_w = (W - (outer_pad * 2) - (gap * (cols - 1))) / cols;
   if (icon_w > S(84)) icon_w = S(84);
   {
-    /* Shrink icons if needed so GRID_ROWS rows + labels + dock fit vertically. */
-    double fit = (eff_h - S(45) - S(14) - S(16) - S(12) - GRID_ROWS * row_gap) / (GRID_ROWS + 1);
+    /* Shrink icons if needed so `rows` + labels + dock fit vertically. */
+    double fit = (eff_h - S(45) - S(14) - S(16) - S(12) - rows * row_gap) / (rows + 1);
     if (fit > S(24) && icon_w > fit) icon_w = fit;
   }
 
@@ -1159,12 +1336,12 @@ static void layout_grid(void) {
   }
 
   double top_off = S(45);
-  gm = (GridMetrics){ (W - (cols * icon_w + (cols - 1) * gap)) / 2, icon_w, gap, row_gap, top_off, cols };
+  gm = (GridMetrics){ (W - (cols * icon_w + (cols - 1) * gap)) / 2, icon_w, gap, row_gap, top_off, cols, rows };
 
   for (int i = 0; i < nmain; i++) {
     App *a = &apps[main_indices[i]];
-    a->page = i / APPS_PER_PAGE;
-    int page_idx = i % APPS_PER_PAGE;
+    a->page = i / per_page;
+    int page_idx = i % per_page;
     int c = page_idx % cols;
     int r = page_idx / cols;
 
@@ -1177,7 +1354,7 @@ static void layout_grid(void) {
     a->icon = (Rect){ grid_start_x + c * (icon_w + gap), top_off + r * (icon_w + row_gap), icon_w, icon_w, icon_r };
   }
 
-  total_pages = (nmain + APPS_PER_PAGE - 1) / APPS_PER_PAGE;
+  total_pages = (nmain + per_page - 1) / per_page;
   if (total_pages < 1) total_pages = 1;
   if (current_page > total_pages - 1) {      /* the last page emptied out while editing */
     current_page = total_pages - 1;
@@ -1221,7 +1398,7 @@ static const double PHI = 1.618033988749895;
 #define CARD_R_PX S(32)
 
 static Rect full_rect(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   return (Rect){ 0, 0, W, eff_h, S(0) };
 }
 
@@ -1235,7 +1412,7 @@ static Rect icon_rect(const App *a) {
 }
 
 static void card_size(double *cw, double *ch) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   *cw = W / PHI;
   *ch = eff_h / PHI;
 }
@@ -1251,7 +1428,7 @@ static void switcher_metrics(double *cw, double *ch, double *left_margin, double
 static Rect card_render_box(int i) {
   double cw, ch, left_margin, max_scroll;
   switcher_metrics(&cw, &ch, &left_margin, &max_scroll);
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   double final_y = (eff_h - ch) / 2;
   if (switcher.entry.dur > 0) {
     double t = clampd((now_ms() - switcher.entry.t0) / switcher.entry.dur, 0, 1);
@@ -1288,7 +1465,7 @@ static Rect geom_pending_rect;
 static void sync_window_geometry_ex(App *a, Rect r, int force) {
   if (!a || a->nwin == 0) return;
 
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   if (r.h >= eff_h - 1) {
     r.h = eff_h - (int)lround(S(12));
   }
@@ -1359,24 +1536,166 @@ static void app_spawn(App *a) {
   }
 }
 
-static void app_raise(App *a) {
-  for (int i = 0; i < a->nwin; i++) {
-    XMapWindow(dpy, a->wins[i]);
-    XRaiseWindow(dpy, a->wins[i]);
+/* Keep the home shell (and OSK) above every client when nothing is in the foreground. */
+static void shell_raise_home(void) {
+  XRaiseWindow(dpy, shell);
+  if (kbd_win != None) XRaiseWindow(dpy, kbd_win);
+  gesture_lane_raise();                      /* lane stays above shell too */
+  if (!active_app) XSetInputFocus(dpy, shell, RevertToPointerRoot, CurrentTime);
+}
+
+/* Bottom edge always receives home-swipe / hold, even over EWMH or OR fullscreen. */
+static int gesture_lane_h(void) {
+  int edge = (int)lround(S(36));
+  int inset = (int)lround(S(12));
+  return edge > inset ? edge : inset;
+}
+
+static void gesture_lane_ensure(void) {
+  int gh = gesture_lane_h();
+  if (gh < 8) gh = 8;
+  if (gesture_lane == None) {
+    XSetWindowAttributes wa;
+    memset(&wa, 0, sizeof wa);
+    wa.override_redirect = True;
+    wa.event_mask = ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
+    gesture_lane = XCreateWindow(dpy, root, 0, H - gh, (unsigned)W, (unsigned)gh, 0,
+                                 0, InputOnly, CopyFromParent,
+                                 CWOverrideRedirect | CWEventMask, &wa);
+  } else {
+    XMoveResizeWindow(dpy, gesture_lane, 0, H - gh, (unsigned)W, (unsigned)gh);
   }
-  XSetInputFocus(dpy, a->nwin > 0 ? a->wins[a->nwin - 1] : shell, RevertToPointerRoot, CurrentTime);
+  XMapWindow(dpy, gesture_lane);
+  XRaiseWindow(dpy, gesture_lane);
 }
 
+static void gesture_lane_raise(void) {
+  if (gesture_lane == None) return;
+  XRaiseWindow(dpy, gesture_lane);
+}
+
+static int app_add_win(App *a, Window w) {
+  if (!a || w == None || w == shell || w == root || w == kbd_win || w == gesture_lane) return 0;
+  for (int i = 0; i < a->nwin; i++) if (a->wins[i] == w) return 1;
+  if (a->nwin >= MAX_WINS) {
+    fprintf(stderr, "summerboard: app \"%s\" hit MAX_WINS (%d); dropping 0x%lx\n",
+            a->name, MAX_WINS, (unsigned long)w);
+    return 0;
+  }
+  a->wins[a->nwin] = w;
+  a->sent_win[a->nwin] = None;
+  a->nwin++;
+  return 1;
+}
+
+static void app_raise(App *a) {
+  int target_h = app_normal_h();
+  /* Raise small → large so the content window ends on top (not a late transient). */
+  int order[MAX_WINS];
+  unsigned area[MAX_WINS];
+  for (int i = 0; i < a->nwin; i++) {
+    order[i] = i;
+    Window rr; int x, y; unsigned ww = 0, hh = 0, b, d;
+    if (XGetGeometry(dpy, a->wins[i], &rr, &x, &y, &ww, &hh, &b, &d))
+      area[i] = ww * hh;
+    else
+      area[i] = 0;
+  }
+  for (int i = 0; i < a->nwin; i++)
+    for (int j = i + 1; j < a->nwin; j++)
+      if (area[order[j]] < area[order[i]]) {
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+      }
+
+  for (int oi = 0; oi < a->nwin; oi++) {
+    Window w = a->wins[order[oi]];
+    /* Chromium FS/notification overlays set opacity 0 for a compositor. We are not
+       one — mapping them leaves an opaque white sheet over the real page. */
+    if (window_opacity_is_zero(w)) {
+      XUnmapWindow(dpy, w);
+      continue;
+    }
+    /* Full-size InputOnly clients sit above the page, eat all touches, show nothing. */
+    if (window_is_input_only(w)) {
+      XUnmapWindow(dpy, w);
+      continue;
+    }
+    /* Even with _NET_WM_STATE_FULLSCREEN, never cover the gesture inset. */
+    if (!window_is_trivial(w))
+      XMoveResizeWindow(dpy, w, 0, 0, W, (unsigned)target_h);
+    else
+      XMoveWindow(dpy, w, 0, 0);
+    XMapWindow(dpy, w);
+    XRaiseWindow(dpy, w);
+    /* Nudge clients that cleared their buffer while unmapped/obscured (Brave). */
+    XClearArea(dpy, w, 0, 0, 0, 0, True);
+  }
+  app_hide_invisible_overlays(a);
+  gesture_lane_raise();
+  Window focus = app_best_content_win(a);
+  XSetInputFocus(dpy, focus != None ? focus : shell, RevertToPointerRoot, CurrentTime);
+  if (focus != None && atom_net_active_window)
+    XChangeProperty(dpy, root, atom_net_active_window, XA_WINDOW, 32,
+                    PropModeReplace, (unsigned char *)&focus, 1);
+  XFlush(dpy);
+}
+
+/* Fully hide for home/background: unmap so stacking policy can keep the shell alone. */
 static void app_lower(App *a) {
+  /* Exit FS first so remount restores a normal, focusable content window. */
+  app_exit_fullscreen(a);
   for (int i = 0; i < a->nwin; i++) XUnmapWindow(dpy, a->wins[i]);
+  /* Also catch windows we never adopted (class/pid mismatch left them unowned). */
+  home_enforce_stacking();
+  shell_raise_home();
+  XFlush(dpy);
 }
 
-/* The real window is never resized while the shell animates: it stays at its rest size, hidden
-   (unmapped), and the shell draws and scales the snapshot instead. */
+/* Cover for swipe / open flight: keep clients MAPPED under the OR shell.
+   Unmapping Brave clears its GL buffers → white flash / white on return. */
 static void app_cover(App *a) {
   if (a->builtin) return;
-  app_lower(a);
+  /* Leave fullscreen before burying under the shell — otherwise OR/EWMH FS
+     windows stay oversized / focus-orphaned and re-enter shows white. */
+  app_exit_fullscreen(a);
   a->covered = 1;
+  for (int i = 0; i < a->nwin; i++) XLowerWindow(dpy, a->wins[i]);
+  shell_raise_home();
+  XFlush(dpy);
+}
+
+/* Put the real window back on screen after a cancelled swipe / open flight. */
+static void app_uncover(App *a) {
+  if (!a || a->builtin) return;
+  a->covered = 0;
+  {
+    Rect rest = full_rect();
+    rest.h = app_normal_h();
+    sync_window_geometry_ex(a, rest, 1);
+  }
+  app_raise(a);
+}
+
+/* Scan the root for windows that already belong to this app (PID/class) so a
+   second tap does not fork another Brave/Tux Paint while one is still alive. */
+static void app_adopt_existing(App *a) {
+  if (!a || a->builtin) return;
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  if (!XQueryTree(dpy, root, &rr, &parent, &kids, &nk) || !kids) return;
+  for (unsigned i = 0; i < nk; i++) {
+    Window w = kids[i];
+    if (w == shell || w == kbd_win) continue;
+    if (find_app_by_win(w) == a) continue;
+    App *owner = find_app_by_pid(window_pid(w));
+    if (!owner) owner = find_app_by_class(w);
+    if (owner == a) app_add_win(a, w);
+  }
+  if (kids) XFree(kids);
+}
+
+static int app_alive(App *a) {
+  if (!a || a->pid <= 1) return 0;
+  return kill(a->pid, 0) == 0 || errno == EPERM;
 }
 
 static void launch(App *a) {
@@ -1395,24 +1714,36 @@ static void launch(App *a) {
 
   Rect target = full_rect();
   {
-    int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+    int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
     target.h = eff_h - (int)lround(S(12));
   }
 
   rs_target(&win_spring, target);
   home_scale_spring.target = 0.92;
-  a->covered = 0;
-  if (a->builtin) builtin_enter(a, fresh);
-  else if (a->nwin == 0) app_spawn(a);   /* its map request is held back until the flight lands */
-  else app_cover(a);                      /* revealed when the flight lands */
+  /* Stay covered until the open flight settles — avoids mapping under the snapshot. */
+  a->covered = 1;
+  if (a->builtin) {
+    a->covered = 0;
+    builtin_enter(a, fresh);
+  } else {
+    app_adopt_existing(a);                   /* reuse Brave/etc. windows still on the server */
+    if (a->nwin > 0) {
+      app_cover(a);                          /* revealed when the flight lands — no second spawn */
+    } else if (app_alive(a)) {
+      /* Process still up but windows gone (or not yet mapped): wait for MapRequest. */
+    } else {
+      app_spawn(a);                          /* MapRequest held until the flight lands */
+    }
+  }
 }
 
 static void minimize_to_icon(App *a, double vx, double vy) {
   a->state = ST_BG;
   flight_app = a->builtin ? NULL : a;   /* keep drawing the window while it flies home */
   if (a->builtin) builtin_leave(a);
-  grab_snapshot(a);
-  app_lower(a);
+  /* Gesture-bar path already snapped before cover; don't grab an empty/unmapped buffer. */
+  if (!a->snap.tex) grab_snapshot(a);
+  app_lower(a);                          /* truly unmap once we commit to home */
   rs_target(&win_spring, icon_rect(a));
   rs_inject(&win_spring, vx * 0.15, vy * 0.15);
   home_scale_spring.target = 1.0;
@@ -1568,10 +1899,11 @@ static void install_sigchld_reaper(void) {
 #define WJ_TIMEOUT_MS 45000.0
 
 enum { WJ_NONE, WJ_RADIO, WJ_TOGGLE, WJ_SCAN, WJ_SAVED, WJ_CONNECT, WJ_DISCONNECT, WJ_FORGET };
-enum { PG_ROOT, PG_WIFI, PG_DISPLAY };
+enum { PG_ROOT, PG_WIFI, PG_DISPLAY, PG_SOUND };
 enum { SH_NONE, SH_PASSWORD, SH_DETAILS };
-enum { H_NONE, H_BACK, H_SCAN, H_TOGGLE, H_ROOT_WIFI, H_ROOT_DISPLAY, H_WALL, H_NET, H_INFO, H_PW_FIELD, H_PW_SHOW,
-       H_PW_CANCEL, H_PW_JOIN, H_D_DISCONNECT, H_D_FORGET, H_D_CLOSE, H_DIM };
+enum { H_NONE, H_BACK, H_SCAN, H_TOGGLE, H_ROOT_WIFI, H_ROOT_DISPLAY, H_ROOT_SOUND, H_WALL, H_NET, H_INFO,
+       H_PW_FIELD, H_PW_SHOW, H_PW_CANCEL, H_PW_JOIN, H_D_DISCONNECT, H_D_FORGET, H_D_CLOSE, H_DIM,
+       H_VOL_SLIDER, H_BOOST_SLIDER };
 
 #define UI_BG   0x110e1e
 #define UI_CARD 0x1e1a2e
@@ -1607,7 +1939,165 @@ static struct {
   Hit hits[MAX_HITS]; int nhits; int rec;
   int press_id, press_arg, dragging;
   double press_x, press_y, press_scroll, max_scroll;
+  /* Sound page: volume 0..100 (ALSA Master), boost 0..100 (softvol 0..+9 dB). */
+  int vol_pct, boost_pct;
+  double vol_track_x, vol_track_w, boost_track_x, boost_track_w;
 } st;
+
+/* ---- ALSA volume + softvol boost (no Pulse/PipeWire on this tablet) ---------- */
+#define SOUND_BOOST_MAX_DB 9.0
+#define SOUND_SOFTVOL_NAME "Summerboard Boost"
+static const char ASOUND_MARKER[] = "# summerboard-softvol";
+
+static int config_sound_file(char *out, size_t n, int make) {
+  const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+  char dir[400];
+  if (xdg && *xdg) snprintf(dir, sizeof dir, "%s/summerboard", xdg);
+  else if (home && *home) {
+    if (make) { char dot[400]; snprintf(dot, sizeof dot, "%s/.config", home); mkdir(dot, 0755); }
+    snprintf(dir, sizeof dir, "%s/.config/summerboard", home);
+  } else return 0;
+  if (make) mkdir(dir, 0755);
+  snprintf(out, n, "%s/sound", dir);
+  return 1;
+}
+
+static int amixer_run(const char *args) {
+  char cmd[256];
+  snprintf(cmd, sizeof cmd, "amixer -q %s >/dev/null 2>&1", args);
+  return system(cmd) == 0;
+}
+
+static int amixer_get_pct(const char *control, int *out_pct) {
+  char cmd[192], line[256];
+  snprintf(cmd, sizeof cmd, "amixer sget '%s' 2>/dev/null", control);
+  FILE *f = popen(cmd, "r");
+  if (!f) return 0;
+  int got = 0, pct = 0;
+  while (fgets(line, sizeof line, f)) {
+    const char *p = strstr(line, "[");
+    while (p) {
+      int v = 0;
+      if (sscanf(p + 1, "%d%%", &v) == 1) { pct = v; got = 1; break; }
+      p = strstr(p + 1, "[");
+    }
+    if (got) break;
+  }
+  pclose(f);
+  if (got) *out_pct = (int)clampd(pct, 0, 100);
+  return got;
+}
+
+/* softvol UI boost 0..100 → mixer percent. Softvol is −1 dB..+9 dB; 0 dB ≈ 10%. */
+static int boost_to_softvol_pct(int boost_ui) {
+  double db = clampd(boost_ui, 0, 100) / 100.0 * SOUND_BOOST_MAX_DB;   /* 0..+9 dB */
+  return (int)lround(clampd((db - (-1.0)) / (SOUND_BOOST_MAX_DB - (-1.0)) * 100.0, 0, 100));
+}
+static int softvol_pct_to_boost(int soft_pct) {
+  double db = -1.0 + clampd(soft_pct, 0, 100) / 100.0 * (SOUND_BOOST_MAX_DB - (-1.0));
+  if (db < 0.05) return 0;
+  return (int)lround(clampd(db / SOUND_BOOST_MAX_DB * 100.0, 0, 100));
+}
+
+static void sound_apply_volume(int pct) {
+  pct = (int)clampd(pct, 0, 100);
+  st.vol_pct = pct;
+  char args[96];
+  snprintf(args, sizeof args, "sset Master %d%% unmute", pct);
+  amixer_run(args);
+  snprintf(args, sizeof args, "sset Speaker %d%% unmute", pct);
+  amixer_run(args);
+}
+
+static void sound_apply_boost(int boost_ui) {
+  boost_ui = (int)clampd(boost_ui, 0, 100);
+  st.boost_pct = boost_ui;
+  char args[128];
+  snprintf(args, sizeof args, "sset '%s' %d%%", SOUND_SOFTVOL_NAME, boost_to_softvol_pct(boost_ui));
+  amixer_run(args);
+}
+
+static void sound_save(void) {
+  char path[512];
+  if (!config_sound_file(path, sizeof path, 1)) return;
+  FILE *f = fopen(path, "w");
+  if (!f) return;
+  fprintf(f, "volume=%d\nboost=%d\n", st.vol_pct, st.boost_pct);
+  fclose(f);
+}
+
+static void sound_ensure_softvol(void) {
+  const char *home = getenv("HOME");
+  if (!home || !home[0]) return;
+  char path[512];
+  snprintf(path, sizeof path, "%s/.asoundrc", home);
+  int have = 0;
+  FILE *rf = fopen(path, "r");
+  if (rf) {
+    char line[256];
+    while (fgets(line, sizeof line, rf))
+      if (strstr(line, ASOUND_MARKER)) { have = 1; break; }
+    fclose(rf);
+  }
+  if (!have) {
+    FILE *wf = fopen(path, "w");
+    if (wf) {
+      fprintf(wf,
+        "%s — do not remove; wraps default PCM in softvol for Settings boost.\n"
+        "pcm.sbboost {\n"
+        "  type softvol\n"
+        "  slave.pcm \"dmix\"\n"
+        "  control {\n"
+        "    name \"%s\"\n"
+        "    card 0\n"
+        "  }\n"
+        "  min_dB -1.0\n"
+        "  max_dB %.1f\n"
+        "  resolution 51\n"
+        "}\n"
+        "pcm.!default {\n"
+        "  type plug\n"
+        "  slave.pcm \"sbboost\"\n"
+        "}\n",
+        ASOUND_MARKER, SOUND_SOFTVOL_NAME, SOUND_BOOST_MAX_DB);
+      fclose(wf);
+    }
+  }
+  /* Opening the PCM registers the mixer control with the kernel. */
+  {
+    int dummy = 0;
+    if (!amixer_get_pct(SOUND_SOFTVOL_NAME, &dummy)) {
+      system("timeout 1 aplay -D sbboost -r 48000 -f S32_LE -c 2 -q /dev/zero >/dev/null 2>&1");
+      usleep(200000);
+    }
+  }
+}
+
+static void sound_load(void) {
+  st.vol_pct = 80;
+  st.boost_pct = 0;
+  int have_cfg = 0;
+  char path[512];
+  if (config_sound_file(path, sizeof path, 0)) {
+    FILE *f = fopen(path, "r");
+    if (f) {
+      char line[128];
+      while (fgets(line, sizeof line, f)) {
+        int v;
+        if (sscanf(line, "volume=%d", &v) == 1) { st.vol_pct = (int)clampd(v, 0, 100); have_cfg = 1; }
+        else if (sscanf(line, "boost=%d", &v) == 1) { st.boost_pct = (int)clampd(v, 0, 100); have_cfg = 1; }
+      }
+      fclose(f);
+    }
+  }
+  sound_ensure_softvol();
+  if (!have_cfg) {
+    int cur = 0;
+    if (amixer_get_pct("Master", &cur)) st.vol_pct = cur;
+  }
+  sound_apply_volume(st.vol_pct);
+  sound_apply_boost(st.boost_pct);
+}
 
 /* ---- demo backend ------------------------------------------------------- */
 static const struct { const char *ssid, *sec, *pw; int sig; } MOCK_NETS[] = {
@@ -2481,7 +2971,7 @@ static void draw_page_root(GImg *t, double dx) {
   if (st.radio_known) snprintf(wv, sizeof wv, "%s", !st.radio_on ? "Off" : st.active_ssid[0] ? st.active_ssid : "Not Connected");
 
   static const struct { const char *name; uint32_t col; } soon[] = {
-    { "Bluetooth", 0x0a84ff }, { "Sounds", 0xff375f }, { "About", 0x8e8e93 } };
+    { "Bluetooth", 0x0a84ff }, { "About", 0x8e8e93 } };
 
   double y = S(96);
   RR c1 = rr_make(dx + m, y, cw, rh, S(12));
@@ -2513,16 +3003,34 @@ static void draw_page_root(GImg *t, double dx) {
   draw_text(t, &F_body, "Display", lx, BL(cy, 16), 1.0, 0, UI_TXT, 1.0, 0, NULL);
   add_hit(dx + m, y, cw, rh, H_ROOT_DISPLAY, 0, 0, t->h);
 
+  y += rh + S(12);
+  RR cs = rr_make(dx + m, y, cw, rh, S(12));
+  fill_rr(t, &cs, UI_CARD, 1.0, NULL);
+  if (pressed(H_ROOT_SOUND, 0)) { RR hr = rr_make(dx + m, y, cw, rh, 0); fill_rr(t, &hr, UI_HI, 1.0, &cs); }
+  cy = y + rh / 2;
+  RR si0 = rr_make(ix, cy - is / 2, is, is, S(7));
+  fill_rr(t, &si0, 0xff375f, 1.0, NULL);
+  ui_disc(t, ix + is / 2, cy, is * 0.18, 0xffffff, 1.0);
+  ui_seg(t, ix + is * 0.38, cy - is * 0.12, ix + is * 0.72, cy - is * 0.28, S(2.2), 0xffffff, 1.0);
+  ui_seg(t, ix + is * 0.38, cy + is * 0.12, ix + is * 0.72, cy + is * 0.28, S(2.2), 0xffffff, 1.0);
+  ui_chevron(t, rx - S(2), cy, S(5.5), 1, UI_SUB, 0.7);
+  char sv[48];
+  if (st.boost_pct > 0) snprintf(sv, sizeof sv, "%d%%  +%.0fdB", st.vol_pct, st.boost_pct / 100.0 * SOUND_BOOST_MAX_DB);
+  else snprintf(sv, sizeof sv, "%d%%", st.vol_pct);
+  ui_text_fit(t, &F_body, sv, rx - S(20), BL(cy, 16), cw * 0.4, 2, UI_SUB, 1.0);
+  draw_text(t, &F_body, "Sound", lx, BL(cy, 16), 1.0, 0, UI_TXT, 1.0, 0, NULL);
+  add_hit(dx + m, y, cw, rh, H_ROOT_SOUND, 0, 0, t->h);
+
   y += rh + S(26);
   draw_text(t, &F_lbl, "COMING SOON", dx + m + S(16), y - S(8), 1.0, 0, UI_SUB, 1.0, S(0.6), NULL);
-  RR c2 = rr_make(dx + m, y, cw, rh * 3, S(12));
+  RR c2 = rr_make(dx + m, y, cw, rh * 2, S(12));
   fill_rr(t, &c2, UI_CARD, 1.0, NULL);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 2; i++) {
     double ry = y + i * rh, rcy = ry + rh / 2;
     RR si = rr_make(ix, rcy - is / 2, is, is, S(7));
     fill_rr(t, &si, soon[i].col, 0.45, NULL);
     draw_text(t, &F_body, soon[i].name, lx, BL(rcy, 16), 1.0, 0, UI_TXT, 0.4, 0, NULL);
-    if (i < 2) fill_rect(t, (int)(dx + m + S(56)), (int)(ry + rh - 1), (int)(cw - S(56)), 1, 0xffffff, 0.07);
+    if (i < 1) fill_rect(t, (int)(dx + m + S(56)), (int)(ry + rh - 1), (int)(cw - S(56)), 1, 0xffffff, 0.07);
   }
 }
 
@@ -2660,6 +3168,71 @@ static void draw_page_display(GImg *t, double dx) {
   draw_text(t, &F_hdr, "Display", dx + t->w / 2, BL(ncy, 20), 1.0, 1, UI_TXT, 1.0, 0, NULL);
 }
 
+static void ui_slider(GImg *t, double x, double y, double w, double h, double k, uint32_t fill) {
+  double track_h = S(4), cy = y + h / 2;
+  RR track = rr_make(x, cy - track_h / 2, w, track_h, track_h / 2);
+  fill_rr(t, &track, 0x3a3654, 1.0, NULL);
+  double fw = w * clampd(k, 0, 1);
+  if (fw > 1) {
+    RR done = rr_make(x, cy - track_h / 2, fw, track_h, track_h / 2);
+    fill_rr(t, &done, fill, 1.0, NULL);
+  }
+  ui_disc(t, x + fw, cy + S(1.2), S(12), 0x000000, 0.22);
+  ui_disc(t, x + fw, cy, S(11), 0xffffff, 1.0);
+}
+
+static void draw_page_sound(GImg *t, double dx) {
+  fill_rect(t, (int)lround(dx), 0, t->w, t->h, UI_BG, 1.0);
+  double m = S(16), rh = S(54), cw = t->w - 2 * m, nav_h = S(60), H_ = t->h;
+  double y = nav_h + S(12) - st.scroll.x;
+
+  draw_text(t, &F_lbl, "VOLUME", dx + m + S(16), y - S(8), 1.0, 0, UI_SUB, 1.0, S(0.6), NULL);
+  RR vc = rr_make(dx + m, y, cw, rh + S(28), S(12));
+  fill_rr(t, &vc, UI_CARD, 1.0, NULL);
+  char vlab[32]; snprintf(vlab, sizeof vlab, "%d%%", st.vol_pct);
+  draw_text(t, &F_body, "Media", dx + m + S(16), BL(y + S(22), 16), 1.0, 0, UI_TXT, 1.0, 0, NULL);
+  draw_text(t, &F_body, vlab, dx + m + cw - S(16), BL(y + S(22), 16), 1.0, 2, UI_SUB, 1.0, 0, NULL);
+  {
+    double sx = dx + m + S(16), sy = y + S(36), sw = cw - S(32), sh = S(36);
+    st.vol_track_x = sx; st.vol_track_w = sw;
+    ui_slider(t, sx, sy, sw, sh, st.vol_pct / 100.0, UI_ACC);
+    add_hit(sx - S(8), sy - S(4), sw + S(16), sh + S(8), H_VOL_SLIDER, 0, nav_h, H_);
+  }
+  y += rh + S(28) + S(20);
+
+  draw_text(t, &F_lbl, "BOOST", dx + m + S(16), y - S(8), 1.0, 0, UI_SUB, 1.0, S(0.6), NULL);
+  RR bc = rr_make(dx + m, y, cw, rh + S(52), S(12));
+  fill_rr(t, &bc, UI_CARD, 1.0, NULL);
+  char blab[48];
+  double bdb = st.boost_pct / 100.0 * SOUND_BOOST_MAX_DB;
+  if (st.boost_pct <= 0) snprintf(blab, sizeof blab, "Off");
+  else snprintf(blab, sizeof blab, "+%.1f dB", bdb);
+  draw_text(t, &F_body, "Extra gain", dx + m + S(16), BL(y + S(22), 16), 1.0, 0, UI_TXT, 1.0, 0, NULL);
+  draw_text(t, &F_body, blab, dx + m + cw - S(16), BL(y + S(22), 16), 1.0, 2,
+            st.boost_pct > 0 ? 0xff9f0a : UI_SUB, 1.0, 0, NULL);
+  {
+    double sx = dx + m + S(16), sy = y + S(36), sw = cw - S(32), sh = S(36);
+    st.boost_track_x = sx; st.boost_track_w = sw;
+    ui_slider(t, sx, sy, sw, sh, st.boost_pct / 100.0, 0xff9f0a);
+    add_hit(sx - S(8), sy - S(4), sw + S(16), sh + S(8), H_BOOST_SLIDER, 0, nav_h, H_);
+  }
+  draw_text(t, &F_lbl, "Above 0 dB may distort on this speaker",
+            dx + m + S(16), y + rh + S(28), 1.0, 0, UI_SUB, 0.85, 0, NULL);
+  y += rh + S(52) + S(24);
+
+  draw_text(t, &F_body, "ALSA Master + softvol (max +9 dB)", dx + t->w / 2, y, 1.0, 1, UI_SUB, 0.55, 0, NULL);
+  y += S(40);
+  st.max_scroll = fmax(0, (y + st.scroll.x + S(24)) - H_);
+
+  fill_rect(t, (int)lround(dx), 0, t->w, (int)nav_h, UI_BG, 1.0);
+  fill_rect(t, (int)lround(dx), (int)nav_h, t->w, 1, 0xffffff, 0.08);
+  double ncy = S(34), ba = pressed(H_BACK, 0) ? 0.45 : 1.0;
+  ui_chevron(t, dx + m + S(4), ncy, S(7), -1, UI_ACC, ba);
+  draw_text(t, &F_body, "Settings", dx + m + S(14), BL(ncy, 16), 1.0, 0, UI_ACC, ba, 0, NULL);
+  add_hit(dx, 0, S(130), nav_h, H_BACK, 0, 0, H_);
+  draw_text(t, &F_hdr, "Sound", dx + t->w / 2, BL(ncy, 20), 1.0, 1, UI_TXT, 1.0, 0, NULL);
+}
+
 static void draw_sheet(GImg *t) {
   double k = clampd(st.sheet.x, 0, 1);
   if (k < 0.004) return;
@@ -2749,6 +3322,7 @@ static void settings_draw(GImg *t, int rec) {
   if (nav < 0.999) draw_page_root(t, -nav * t->w * 0.28);
   if (nav > 0.001 && nav < 0.999) fill_rect(t, 0, 0, t->w, t->h, 0x000000, 0.35 * nav);
   if (nav > 0.001 && sub == PG_DISPLAY) draw_page_display(t, (1 - nav) * t->w);
+  else if (nav > 0.001 && sub == PG_SOUND) draw_page_sound(t, (1 - nav) * t->w);
   else if (nav > 0.001) draw_page_wifi(t, (1 - nav) * t->w);
   draw_sheet(t);
   draw_toast(t);
@@ -2767,7 +3341,7 @@ static void settings_paint(GImg *t, Rect r) {
 }
 
 static void settings_snapshot(App *a) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   if (!a->snap.fbo || a->snap.w != W || a->snap.h != eff_h) img_make_target(&a->snap, W, eff_h);
   img_clear(&a->snap);
   settings_draw(&a->snap, 0);
@@ -2851,10 +3425,16 @@ static void settings_dispatch(int id, int arg) {
       wall_scan();
       st.page = st.shown = PG_DISPLAY; st.nav.target = 1; sp_snap(&st.scroll, 0);
       break;
+    case H_ROOT_SOUND:
+      st.page = st.shown = PG_SOUND; st.nav.target = 1; sp_snap(&st.scroll, 0);
+      break;
     case H_WALL:
       if (arg < 0) wallpaper_apply(NULL, 1);
       else if (arg < nwalls) wallpaper_apply(walls[arg].path, 1);
       break;
+    case H_VOL_SLIDER:
+    case H_BOOST_SLIDER:
+      break;   /* dragging handled in pointer move/up */
     case H_BACK: st.page = PG_ROOT; st.nav.target = 0; break;
     case H_SCAN: if (st.radio_on && st.job.kind != WJ_SCAN) wj_queue(WJ_SCAN, NULL, NULL, 0, 0); break;
     case H_TOGGLE: wifi_toggle(); break;
@@ -2878,10 +3458,24 @@ static void settings_pointer_down(double x, double y) {
   if (h) { st.press_id = h->id; st.press_arg = h->arg; }
 }
 
+static void sound_slider_at(int which, double x) {
+  double tx = which == H_VOL_SLIDER ? st.vol_track_x : st.boost_track_x;
+  double tw = which == H_VOL_SLIDER ? st.vol_track_w : st.boost_track_w;
+  if (tw < 1) return;
+  int pct = (int)lround(clampd((x - tx) / tw, 0, 1) * 100.0);
+  if (which == H_VOL_SLIDER) sound_apply_volume(pct);
+  else sound_apply_boost(pct);
+}
+
 static void settings_pointer_move(double x, double y) {
+  if (st.press_id == H_VOL_SLIDER || st.press_id == H_BOOST_SLIDER) {
+    sound_slider_at(st.press_id, x);
+    return;
+  }
   if (hypot(x - st.press_x, y - st.press_y) > S(10)) {
     st.press_id = 0;
-    if ((st.page == PG_WIFI || st.page == PG_DISPLAY) && !st.sheet_open) st.dragging = 1;
+    if ((st.page == PG_WIFI || st.page == PG_DISPLAY || st.page == PG_SOUND) && !st.sheet_open)
+      st.dragging = 1;
   }
   if (!st.dragging) return;
   double v = st.press_scroll - (y - st.press_y);
@@ -2891,6 +3485,12 @@ static void settings_pointer_move(double x, double y) {
 }
 
 static void settings_pointer_up(double x, double y, double vy) {
+  if (st.press_id == H_VOL_SLIDER || st.press_id == H_BOOST_SLIDER) {
+    sound_slider_at(st.press_id, x);
+    sound_save();
+    st.press_id = 0;
+    return;
+  }
   if (st.dragging) {
     st.dragging = 0;
     st.scroll.target = clampd(st.scroll.x - vy * 0.22, 0, st.max_scroll);
@@ -2925,6 +3525,7 @@ static void settings_init(void) {
   sp_init(&st.sheet, 0, 340, 30, 0.002);
   st.mock = opt_mock_wifi || !wifi_tools_present();
   if (st.mock) { mock_active = 0; mock_saved[0] = 1; }
+  sound_load();
 }
 
 static void settings_open(int fresh) {
@@ -3003,7 +3604,7 @@ static void resume(App *a, Rect from_rect) {
 
   Rect target = full_rect();
   {
-    int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+    int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
     target.h = eff_h - (int)lround(S(12));
   }
 
@@ -3015,6 +3616,8 @@ static void resume(App *a, Rect from_rect) {
 
 static void close_switcher_to_home(void) {
   switcher.open = 0; switcher.entry.dur = 0; active_app = NULL;
+  for (int i = 0; i < app_count; i++) if (apps[i].state == ST_BG) app_lower(&apps[i]);
+  shell_raise_home();
   if (gesture) { free(gesture); gesture = NULL; }
   home_scale_spring.target = 1.0;
 }
@@ -3022,20 +3625,52 @@ static void close_switcher_to_home(void) {
 /* ------------------------------------------------------------------------ */
 /* SNAPSHOT CAPTURE                                                         */
 /* ------------------------------------------------------------------------ */
-/* An X window is read back once per gesture into a plain buffer and uploaded as a texture.
-   The Settings app renders straight into its own target instead (settings_snapshot). */
+/* Snapshot for flight/card previews.
+   Root grab (real pixels) only while the app itself is on top — never when the shell
+   already covers it or the switcher/hold UI is up (that would bake the switcher into
+   the app preview). Call root-grab BEFORE app_cover. */
 static void grab_snapshot_impl(App *a) {
   if (a->builtin) { settings_snapshot(a); return; }
   if (a->nwin == 0) return;
-  Window w = a->wins[a->nwin - 1];
+  Window w = app_best_content_win(a);
+  if (w == None) w = a->wins[a->nwin - 1];
   XWindowAttributes wa;
   if (!XGetWindowAttributes(dpy, w, &wa) || wa.map_state != IsViewable) return;
   if (wa.width < 1 || wa.height < 1) return;
 
+  /* Shell / switcher is compositing over the client — keep an existing snap, don't
+     overwrite it with a screenshot of our own UI. */
+  int shell_over_app = a->covered || switcher.open
+      || (gesture && strcmp(gesture->mode, "drag") == 0 && gesture->hold_fired);
+  if (shell_over_app && a->snap.tex) return;
+
+  Window child = None;
+  int rx = 0, ry = 0;
+  if (!XTranslateCoordinates(dpy, w, root, 0, 0, &rx, &ry, &child)) return;
+
+  int x0 = rx < 0 ? 0 : rx;
+  int y0 = ry < 0 ? 0 : ry;
+  int x1 = rx + wa.width; if (x1 > W) x1 = W;
+  int y1 = ry + wa.height; if (y1 > H) y1 = H;
+  int wd = x1 - x0, ht = y1 - y0;
+  if (wd < 2 || ht < 2) return;
+
   XSync(dpy, False);
   XErrorHandler old_h = XSetErrorHandler(xerr_handler);
   xerr_trap = 0;
-  XImage *im = XGetImage(dpy, w, 0, 0, wa.width, wa.height, AllPlanes, ZPixmap);
+  XImage *im = NULL;
+  /* Root grab only when the app pixels are what's on screen. */
+  if (!shell_over_app) {
+    im = XGetImage(dpy, root, x0, y0, (unsigned)wd, (unsigned)ht, AllPlanes, ZPixmap);
+    if (xerr_trap || !im) {
+      if (im) { XDestroyImage(im); im = NULL; }
+      xerr_trap = 0;
+    }
+  }
+  if (!im) {
+    im = XGetImage(dpy, w, 0, 0, wa.width, wa.height, AllPlanes, ZPixmap);
+    wd = wa.width; ht = wa.height;
+  }
   XSync(dpy, False);
   XSetErrorHandler(old_h);
 
@@ -3044,7 +3679,6 @@ static void grab_snapshot_impl(App *a) {
     return;
   }
 
-  int wd = wa.width, ht = wa.height;
   uint32_t *buf = malloc((size_t)wd * ht * 4);
   if (buf) {
     const uint16_t one = 1;
@@ -3073,7 +3707,13 @@ static void activate_switcher(void) {
   flight_app = NULL;
   Rect stage = live_anchor_rect();
   App *held = active_app;
-  if (held) { held->state = ST_BG; if (held->builtin) builtin_leave(held); grab_snapshot(held); app_lower(held); }
+  /* Keep the gesture-bar snap — a fresh root grab here would capture the switcher UI. */
+  if (held) {
+    held->state = ST_BG;
+    if (held->builtin) builtin_leave(held);
+    if (!held->snap.tex) grab_snapshot(held);
+    app_lower(held);
+  }
 
   int running_indices[MAX_APPS], nrun = 0;
   for (int i = 0; i < app_count; i++) if (apps[i].state != ST_CLOSED) running_indices[nrun++] = i;
@@ -3112,7 +3752,7 @@ static void activate_switcher(void) {
 /* ------------------------------------------------------------------------ */
 static void sp_from(Spring *s, double from) { s->x = from; s->v = 0; s->target = 0; }
 
-static int is_removable(const App *a) { return !a->builtin && !a->is_kbd; }
+static int is_removable(const App *a) { return !a->builtin; }   /* Keyboard icon gets a minus badge; restore via + */
 
 static int hidden_count(void) {
   int n = 0;
@@ -3256,9 +3896,11 @@ static void drag_target(const App *self, double px, double py, int *to_dock, int
   double wx = px + page_offset_spring.x;
   int page = (int)clampd(floor(wx / W), 0, total_pages - 1);
   double lx = wx - page * (double)W;
-  int col = (int)clampd(lround((lx - gm.left - gm.icon_w / 2) / (gm.icon_w + gm.gap)), 0, gm.cols - 1);
-  int row = (int)clampd(lround((py - gm.top - gm.icon_w / 2) / (gm.icon_w + gm.row_gap)), 0, GRID_ROWS - 1);
-  int s = page * APPS_PER_PAGE + row * GRID_COLS + col;
+  int cols = gm.cols > 0 ? gm.cols : grid_cols_for(W, H);
+  int rows = gm.rows > 0 ? gm.rows : grid_rows_for(W, H);
+  int col = (int)clampd(lround((lx - gm.left - gm.icon_w / 2) / (gm.icon_w + gm.gap)), 0, cols - 1);
+  int row = (int)clampd(lround((py - gm.top - gm.icon_w / 2) / (gm.icon_w + gm.row_gap)), 0, rows - 1);
+  int s = page * (cols * rows) + row * cols + col;
   *to_dock = 0; *slot = s > nm ? nm : s;
 }
 
@@ -3343,6 +3985,7 @@ static void end_drag(void) {
 /* ---- removing / restoring ---- */
 static void remove_app(App *a) {
   if (!is_removable(a) || a->removing) return;
+  if (a->is_kbd && kbd_active) toggle_matchbox_keyboard();   /* dismiss OSK if its home icon is removed */
   a->removing = 1;
   a->press_scale.target = 0.0;
 }
@@ -3387,7 +4030,7 @@ static void badge_geom(Rect ir, double *cx, double *cy, double *d) {
 typedef struct { Rect box; double x0, y0, cell_w, cell_h, icon; int cols; } PanelGeom;
 #define PANEL_MAX 20
 static void panel_geom(PanelGeom *g, int n) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   g->cols = 4;
   int rows = (n + g->cols - 1) / g->cols; if (rows < 1) rows = 1;
   double w = fmin(W - S(40), S(440));
@@ -3574,7 +4217,7 @@ static void compute_velocity(double *vx, double *vy) {
 }
 
 static int on_pointer_down(double x, double y) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
 
   if (kbd_active && y >= eff_h) {
     if (active_app && active_app->nwin > 0) {
@@ -3617,8 +4260,15 @@ static int on_pointer_down(double x, double y) {
     strcpy(gesture->mode, "drag");
     gesture->rect = active_app ? full_rect() : (Rect){0};
     if (active_app && !active_app->builtin) {
-      grab_snapshot(active_app);   /* the screenshot is taken the moment the bar is touched */
-      app_cover(active_app);       /* from here on the shell scales the snapshot, not the window */
+      /* Snapshot while the client is still on top. Do NOT cover yet — covering
+         (shell above Brave) makes Chromium pause/clear → white swipe & white return.
+         Cover starts once the finger actually moves (see on_pointer_move). */
+      grab_snapshot(active_app);
+      if (active_app->nwin > 0) {
+        Rect full = full_rect();
+        full.h = eff_h - (int)lround(S(12));
+        rs_snap(&win_spring, full);
+      }
     }
     gesture->start_x = x; gesture->start_y = y; gesture->px = x; gesture->py = y;
     gesture->last_move_t = now_ms(); gesture->last_move_x = x; gesture->last_move_y = y;
@@ -3665,7 +4315,7 @@ static void on_pointer_move(double x, double y) {
   if (!gesture) return;
   record_touch(x, y);
   gesture->px = x; gesture->py = y;
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   if (!gesture->moved && hypot(x - gesture->start_x, y - gesture->start_y) > S(8)) gesture->moved = 1;
 
   if (strcmp(gesture->mode, "iconDrag") == 0) return;           /* drawn from the finger; drag_tick() reorders */
@@ -3718,6 +4368,12 @@ static void on_pointer_move(double x, double y) {
   double t = gesture->dy / drag_up;
   double dx = x - gesture->start_x;
 
+  if (active_app && !active_app->builtin && !active_app->covered
+      && (gesture->moved || gesture->dy > S(6))) {
+    if (!active_app->snap.tex) grab_snapshot(active_app);  /* rare: first grab failed */
+    app_cover(active_app);
+  }
+
   if (active_app) {
     if (!active_app->builtin) flight_app = active_app;   /* following the finger toward the icon */
     Rect full = full_rect(), icon = icon_rect(active_app);
@@ -3750,7 +4406,7 @@ static void on_pointer_up(double x, double y) {
   }
   if (!gesture) return;
   double vx, vy; compute_velocity(&vx, &vy);
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
 
   if (strcmp(gesture->mode, "iconDrag") == 0) { end_drag(); return; }
   if (strcmp(gesture->mode, "editPress") == 0 || strcmp(gesture->mode, "doneTap") == 0 ||
@@ -3810,10 +4466,13 @@ static void on_pointer_up(double x, double y) {
       double t = gesture->dy / (eff_h * 0.55);
       if (t > 0.35 || vy < -300) minimize_to_icon(active_app, vx, vy);
       else {
+        /* Cancelled swipe: restore immediately. Waiting for the spring left Brave
+           stuck covered/unmapped when the main loop went idle. */
         Rect target = full_rect();
         target.h = eff_h - (int)lround(S(12));
-        rs_target(&win_spring, target);
-        free(gesture); gesture = NULL;   /* the window is revealed once the snapshot is back */
+        rs_snap(&win_spring, target);
+        if (!active_app->builtin) app_uncover(active_app);
+        free(gesture); gesture = NULL;
       }
     } else { free(gesture); gesture = NULL; }
   }
@@ -4056,7 +4715,7 @@ static void draw_background(GImg *t, int eff_h) {
 }
 
 static void render_frame(void) {
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
   GImg *t = &gl_screen;
   draw_background(t, eff_h);
 
@@ -4147,15 +4806,13 @@ static void render_frame(void) {
   }
 
   /* Spring settled at rest with nobody touching: hand the screen to the real window (this frame
-     still carried the snapshot, so there is no gap). */
+     still carried the snapshot, so there is no gap). Keep the snapshot until after raise so a
+     slow Chromium redraw cannot flash white for a frame. */
   if (active_app && active_app->covered && !active_app->builtin && !gesture && !switcher.open
       && !rs_busy(&win_spring)) {
     App *a = active_app;
-    Rect rest = full_rect();
-    rest.h = eff_h - (int)lround(S(12));
-    a->covered = 0;
-    sync_window_geometry_ex(a, rest, 1);
-    app_raise(a);
+    app_uncover(a);
+    XSync(dpy, False);
     snap_drop(a);
   }
 }
@@ -4231,6 +4888,360 @@ static App *find_app_by_win(Window w) {
   return NULL;
 }
 
+static pid_t window_pid(Window w) {
+  Atom pid_atom = XInternAtom(dpy, "_NET_WM_PID", True);
+  if (pid_atom == None) return 0;
+  Atom type; int fmt; unsigned long n = 0, bytes = 0; unsigned char *prop = NULL;
+  if (XGetWindowProperty(dpy, w, pid_atom, 0, 1, False, XA_CARDINAL,
+                         &type, &fmt, &n, &bytes, &prop) != Success || !prop || n < 1) {
+    if (prop) XFree(prop);
+    return 0;
+  }
+  pid_t pid = (pid_t)(*(unsigned long *)prop);
+  XFree(prop);
+  return pid > 1 ? pid : 0;
+}
+
+/* True if `pid` is `root` or a descendant of `root` (Chromium helpers, etc.). */
+static int pid_in_tree(pid_t root, pid_t pid) {
+  if (root <= 1 || pid <= 1) return 0;
+  if (pid == root) return 1;
+  for (int guard = 0; guard < 64 && pid > 1; guard++) {
+    pid_t pp = 0;
+    if (kt_stat(pid, &pp, NULL, NULL) < 0) return 0;
+    if (pp == root) return 1;
+    if (pp <= 1 || pp == pid) return 0;
+    pid = pp;
+  }
+  return 0;
+}
+
+static App *find_app_by_pid(pid_t pid) {
+  if (pid <= 1) return NULL;
+  for (int i = 0; i < app_count; i++) {
+    if (apps[i].pid > 1 && pid_in_tree(apps[i].pid, pid)) return &apps[i];
+  }
+  return NULL;
+}
+
+/* Lowercase in place; strip Chromium channel suffixes so brave-browser-stable ↔ brave-browser. */
+static void class_key_normalize(char *s) {
+  for (int i = 0; s[i]; i++) s[i] = (char)tolower((unsigned char)s[i]);
+  static const char *suf[] = { "-stable", "-snapshot", "-beta", "-unstable", "-nightly", ".exe" };
+  for (int i = 0; i < (int)(sizeof suf / sizeof suf[0]); i++) {
+    size_t n = strlen(s), m = strlen(suf[i]);
+    if (n > m && strcmp(s + n - m, suf[i]) == 0) s[n - m] = 0;
+  }
+}
+
+/* Match WM_CLASS against StartupWMClass, command basename, or app name (Brave/Tux Paint). */
+static App *find_app_by_class(Window w) {
+  XClassHint ch;
+  if (!XGetClassHint(dpy, w, &ch)) return NULL;
+  char blob[256];
+  snprintf(blob, sizeof blob, "%s %s", ch.res_name ? ch.res_name : "", ch.res_class ? ch.res_class : "");
+  class_key_normalize(blob);
+  if (ch.res_name) XFree(ch.res_name);
+  if (ch.res_class) XFree(ch.res_class);
+
+  for (int i = 0; i < app_count; i++) {
+    if (apps[i].builtin || apps[i].is_kbd) continue;
+
+    if (apps[i].wm_class[0]) {
+      char wc[96];
+      snprintf(wc, sizeof wc, "%s", apps[i].wm_class);
+      class_key_normalize(wc);
+      if (wc[0] && strstr(blob, wc)) return &apps[i];
+    }
+
+    char key[96];
+    snprintf(key, sizeof key, "%s", apps[i].name);
+    class_key_normalize(key);
+    /* "brave web browser" → also try leading token "brave" */
+    if (key[0] && strstr(blob, key)) return &apps[i];
+    {
+      char tok[96];
+      snprintf(tok, sizeof tok, "%s", key);
+      tok[strcspn(tok, " \t-")] = 0;
+      if (strlen(tok) >= 3 && strstr(blob, tok)) return &apps[i];
+    }
+
+    const char *slash = strrchr(apps[i].cmd, '/');
+    const char *base = slash ? slash + 1 : apps[i].cmd;
+    char b2[96];
+    snprintf(b2, sizeof b2, "%s", base);
+    b2[strcspn(b2, " \t")] = 0;
+    class_key_normalize(b2);
+    if (b2[0] && strstr(blob, b2)) return &apps[i];
+  }
+  return NULL;
+}
+
+static int window_is_trivial(Window w) {
+  Window rr; int x, y; unsigned ww, hh, b, d;
+  if (!XGetGeometry(dpy, w, &rr, &x, &y, &ww, &hh, &b, &d)) return 1;
+  return ww < 64 || hh < 64;                 /* clipboard / tooltip / 10x10 stubs */
+}
+
+static int app_normal_h(void) {
+  int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+  return eff_h - (int)lround(S(12));
+}
+
+/* Largest non-trivial top-level — content surface, not a late FS chrome/transient. */
+static Window app_best_content_win(App *a) {
+  if (!a || a->nwin <= 0) return None;
+  Window best = None;
+  unsigned best_area = 0;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    if (window_opacity_is_zero(w) || window_is_input_only(w)) continue;
+    Window rr; int x, y; unsigned ww, hh, b, d;
+    if (!XGetGeometry(dpy, w, &rr, &x, &y, &ww, &hh, &b, &d)) continue;
+    if (ww < 64 || hh < 64) continue;
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(dpy, w, &wa) && wa.map_state == IsUnmapped) continue;
+    unsigned area = ww * hh;
+    if (area >= best_area) { best_area = area; best = w; }
+  }
+  if (best != None) return best;
+  for (int i = a->nwin - 1; i >= 0; i--)
+    if (!window_opacity_is_zero(a->wins[i]) && !window_is_input_only(a->wins[i]))
+      return a->wins[i];
+  return a->wins[a->nwin - 1];
+}
+
+static int window_has_fullscreen_state(Window w) {
+  if (w == None || !atom_net_wm_state || !atom_net_wm_state_fullscreen) return 0;
+  Atom type = None; int fmt = 0; unsigned long n = 0, bytes = 0; unsigned char *prop = NULL;
+  int ok = XGetWindowProperty(dpy, w, atom_net_wm_state, 0, 64, False, XA_ATOM,
+                              &type, &fmt, &n, &bytes, &prop);
+  int found = 0;
+  if (ok == Success && prop && type == XA_ATOM && fmt == 32) {
+    Atom *atoms = (Atom *)prop;
+    for (unsigned long i = 0; i < n; i++)
+      if (atoms[i] == atom_net_wm_state_fullscreen) { found = 1; break; }
+  }
+  if (prop) XFree(prop);
+  return found;
+}
+
+/* Chromium sets _NET_WM_WINDOW_OPACITY=0 on OR overlays expecting a compositor to
+   hide them. Without one they paint opaque (often white) over the real window. */
+static int window_opacity_is_zero(Window w) {
+  if (w == None || !atom_net_wm_window_opacity) return 0;
+  Atom type = None; int fmt = 0; unsigned long n = 0, bytes = 0; unsigned char *prop = NULL;
+  int ok = XGetWindowProperty(dpy, w, atom_net_wm_window_opacity, 0, 1, False, XA_CARDINAL,
+                              &type, &fmt, &n, &bytes, &prop);
+  int zero = 0;
+  if (ok == Success && prop && type == XA_CARDINAL && fmt == 32 && n >= 1)
+    zero = (*(unsigned long *)prop == 0);
+  if (prop) XFree(prop);
+  return zero;
+}
+
+static int window_is_input_only(Window w) {
+  XWindowAttributes wa;
+  if (w == None || w == gesture_lane) return 0;
+  if (!XGetWindowAttributes(dpy, w, &wa)) return 0;
+  return wa.class == InputOnly;
+}
+
+static void app_hide_invisible_overlays(App *a) {
+  if (!a) return;
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  if (!XQueryTree(dpy, root, &rr, &parent, &kids, &nk) || !kids) return;
+  for (unsigned i = 0; i < nk; i++) {
+    Window w = kids[i];
+    if (w == shell || w == kbd_win || w == gesture_lane) continue;
+    App *owner = find_app_by_win(w);
+    if (!owner) owner = find_app_by_pid(window_pid(w));
+    if (!owner) owner = find_app_by_class(w);
+    if (a && owner != a) continue;
+    /* Opacity-0 sheets (white) and large InputOnly traps (dead touch). */
+    if (!window_opacity_is_zero(w) && !window_is_input_only(w)) continue;
+    app_add_win(owner ? owner : a, w);
+    XUnmapWindow(dpy, w);
+  }
+  XFree(kids);
+}
+
+/* Geometry covers the monitor (EWMH FS or override-redirect FS popup). */
+static int window_looks_fullscreen(Window w) {
+  if (window_has_fullscreen_state(w)) return 1;
+  Window rr; int x, y; unsigned ww, hh, b, d;
+  if (!XGetGeometry(dpy, w, &rr, &x, &y, &ww, &hh, &b, &d)) return 0;
+  return (int)ww >= W - 2 && (int)hh >= H - 8;
+}
+
+static void window_apply_fullscreen(Window w, int on) {
+  if (w == None || !atom_net_wm_state || !atom_net_wm_state_fullscreen) return;
+
+  Atom type = None; int fmt = 0; unsigned long n = 0, bytes = 0; unsigned char *prop = NULL;
+  Atom keep[64]; int nkeep = 0;
+  if (XGetWindowProperty(dpy, w, atom_net_wm_state, 0, 64, False, XA_ATOM,
+                         &type, &fmt, &n, &bytes, &prop) == Success && prop
+      && type == XA_ATOM && fmt == 32) {
+    Atom *atoms = (Atom *)prop;
+    for (unsigned long i = 0; i < n && nkeep < 63; i++)
+      if (atoms[i] != atom_net_wm_state_fullscreen && atoms[i] != None)
+        keep[nkeep++] = atoms[i];
+  }
+  if (prop) XFree(prop);
+  if (on) keep[nkeep++] = atom_net_wm_state_fullscreen;
+
+  if (nkeep > 0)
+    XChangeProperty(dpy, w, atom_net_wm_state, XA_ATOM, 32, PropModeReplace,
+                    (unsigned char *)keep, nkeep);
+  else
+    XDeleteProperty(dpy, w, atom_net_wm_state);
+
+  /* Geometry always leaves the home-gesture inset — FULLSCREEN hides client chrome,
+     it must not bury the gesture bar / lane. */
+  if (!window_is_trivial(w))
+    XMoveResizeWindow(dpy, w, 0, 0, W, (unsigned)app_normal_h());
+  gesture_lane_raise();
+}
+
+/* Clear FS on every tracked top-level before cover/unmap so re-enter is recoverable. */
+static void app_exit_fullscreen(App *a) {
+  if (!a || a->builtin) return;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    if (window_is_trivial(w)) continue;
+    if (window_has_fullscreen_state(w) || window_looks_fullscreen(w))
+      window_apply_fullscreen(w, 0);
+  }
+  /* Also clear FS on untracked root children that belong to this app (OR FS). */
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  if (XQueryTree(dpy, root, &rr, &parent, &kids, &nk) && kids) {
+    for (unsigned i = 0; i < nk; i++) {
+      Window w = kids[i];
+      if (w == shell || w == kbd_win || w == gesture_lane) continue;
+      App *owner = find_app_by_win(w);
+      if (!owner) owner = find_app_by_pid(window_pid(w));
+      if (!owner) owner = find_app_by_class(w);
+      if (owner != a) continue;
+      app_add_win(a, w);
+      if (window_opacity_is_zero(w)) {
+        XUnmapWindow(dpy, w);
+        continue;
+      }
+      if (!window_is_trivial(w) && (window_has_fullscreen_state(w) || window_looks_fullscreen(w)))
+        window_apply_fullscreen(w, 0);
+    }
+    XFree(kids);
+  }
+  app_hide_invisible_overlays(a);
+  XFlush(dpy);
+}
+
+static void ewmh_init(void) {
+  atom_net_supported = XInternAtom(dpy, "_NET_SUPPORTED", False);
+  atom_net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
+  atom_net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+  atom_net_active_window = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
+  atom_net_wm_window_opacity = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
+  Atom supported[] = {
+    atom_net_wm_state,
+    atom_net_wm_state_fullscreen,
+    atom_net_active_window,
+  };
+  XChangeProperty(dpy, root, atom_net_supported, XA_ATOM, 32, PropModeReplace,
+                  (unsigned char *)supported, (int)(sizeof supported / sizeof supported[0]));
+}
+
+static void on_property_notify(XPropertyEvent *e) {
+  if (!e || e->atom != atom_net_wm_window_opacity) return;
+  if (!window_opacity_is_zero(e->window)) return;
+  XUnmapWindow(dpy, e->window);
+  App *app = find_app_by_win(e->window);
+  if (!app) app = find_app_by_pid(window_pid(e->window));
+  if (!app) app = find_app_by_class(e->window);
+  if (app && client_may_show(app, e->window)) {
+    Window focus = app_best_content_win(app);
+    if (focus != None) XSetInputFocus(dpy, focus, RevertToPointerRoot, CurrentTime);
+    gesture_lane_raise();
+  }
+}
+
+static void on_client_message(XClientMessageEvent *e) {
+  if (e->message_type != atom_net_wm_state) return;
+  Atom a1 = (Atom)e->data.l[1];
+  Atom a2 = (Atom)e->data.l[2];
+  if (a1 != atom_net_wm_state_fullscreen && a2 != atom_net_wm_state_fullscreen) return;
+
+  Window w = e->window;
+  App *app = find_app_by_win(w);
+  if (!app) app = find_app_by_pid(window_pid(w));
+  if (!app) app = find_app_by_class(w);
+  if (app) app_add_win(app, w);
+
+  int cur = window_has_fullscreen_state(w);
+  int action = (int)e->data.l[0]; /* 0=remove 1=add 2=toggle */
+  int want = cur;
+  if (action == 0) want = 0;
+  else if (action == 1) want = 1;
+  else if (action == 2) want = !cur;
+
+  /* Only the visible FG app may enter fullscreen. */
+  if (want && !client_may_show(app, w)) return;
+
+  window_apply_fullscreen(w, want);
+  if (want && app && client_may_show(app, w)) {
+    XMapWindow(dpy, w);
+    XRaiseWindow(dpy, w);
+    gesture_lane_raise();
+    XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
+    if (atom_net_active_window)
+      XChangeProperty(dpy, root, atom_net_active_window, XA_WINDOW, 32,
+                      PropModeReplace, (unsigned char *)&w, 1);
+  } else if (!want && app && client_may_show(app, w)) {
+    Window focus = app_best_content_win(app);
+    if (focus != None) XSetInputFocus(dpy, focus, RevertToPointerRoot, CurrentTime);
+    gesture_lane_raise();
+  }
+  XFlush(dpy);
+}
+
+/* Own a client window for `a`. If the app is not foreground, keep it unmapped so it
+   cannot cover the home shell (Brave/Chromium spawn helpers after "home"). */
+static void manage_client_window(App *a, Window w) {
+  if (!a || w == None) return;
+  XSelectInput(dpy, w, StructureNotifyMask | PropertyChangeMask);
+  app_add_win(a, w);
+
+  /* InputOnly top-levels steal touches; keep tracked but never show them. */
+  if (window_is_input_only(w) || window_opacity_is_zero(w)) {
+    XUnmapWindow(dpy, w);
+    return;
+  }
+
+  int target_h = app_normal_h();
+  XSetWindowBorderWidth(dpy, w, 0);
+  if (!window_is_trivial(w))
+    XMoveResizeWindow(dpy, w, 0, 0, W, (unsigned)target_h);
+  for (int i = 0; i < a->nwin; i++)
+    if (a->wins[i] == w) a->sent_win[i] = None;
+
+  int show = (active_app == a && a->state == ST_FG && !a->covered && !rs_busy(&win_spring) && !gesture && !switcher.open);
+  if (!show) {
+    XUnmapWindow(dpy, w);
+    shell_raise_home();
+    return;
+  }
+  a->covered = 0;
+  XMapWindow(dpy, w);
+  XRaiseWindow(dpy, w);
+  gesture_lane_raise();
+  Window focus = !window_is_trivial(w) ? w : app_best_content_win(a);
+  if (focus == None) focus = w;
+  XSetInputFocus(dpy, focus, RevertToPointerRoot, CurrentTime);
+  Rect full = full_rect();
+  full.h = target_h;
+  rs_snap(&win_spring, full);
+}
+
 static void on_map_request(XMapRequestEvent *e) {
   XSelectInput(dpy, e->window, StructureNotifyMask | PropertyChangeMask);
 
@@ -4247,7 +5258,7 @@ static void on_map_request(XMapRequestEvent *e) {
 
   if (is_keyboard_window || (kbd_active && kbd_win == None)) {
     kbd_win = e->window;
-    int kbd_y = (int)lround(H * 0.75);
+    int kbd_y = (int)lround(H * 0.65);
     int kbd_h = H - kbd_y;
 
     Atom wm_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
@@ -4259,45 +5270,147 @@ static void on_map_request(XMapRequestEvent *e) {
     XRaiseWindow(dpy, e->window);
 
     if (active_app && active_app->nwin > 0) {
-      XSetInputFocus(dpy, active_app->wins[active_app->nwin - 1], RevertToPointerRoot, CurrentTime);
+      Window focus = app_best_content_win(active_app);
+      XSetInputFocus(dpy, focus != None ? focus : active_app->wins[active_app->nwin - 1],
+                     RevertToPointerRoot, CurrentTime);
+    } else {
+      shell_raise_home();
     }
     return;
   }
 
   App *a = find_app_by_win(e->window);
+  if (!a) a = find_app_by_pid(window_pid(e->window));
+  if (!a) a = find_app_by_class(e->window);
   if (!a) {
     if (active_app && active_app->builtin) {   /* built-ins own no windows: send them to the background */
       App *b = active_app;
       b->state = ST_BG; builtin_leave(b); grab_snapshot(b);
       active_app = NULL;
+      shell_raise_home();
     }
-    a = active_app ? active_app : &apps[0];
-    if (a->nwin < MAX_WINS) a->wins[a->nwin++] = e->window;
+    /* Only the foreground launch may claim an unmatched MapRequest. Never dump onto apps[0]. */
+    if (active_app && !active_app->builtin && active_app->state == ST_FG)
+      a = active_app;
   }
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
-
-  int target_h = eff_h - (int)lround(S(12));
-
-  XSetWindowBorderWidth(dpy, e->window, 0);   /* a border pushes the content off-screen */
-  XMoveResizeWindow(dpy, e->window, 0, 0, W, target_h);
-  for (int i = 0; i < a->nwin; i++)
-    if (a->wins[i] == e->window) { a->sent_win[i] = None; }   /* force next sync to resend */
-  a->state = ST_FG;
-  active_app = a;
-
-  if (rs_busy(&win_spring) || gesture) {
-    /* Launching: keep the window unmapped at its rest size until the flight lands. */
-    a->covered = 1;
+  if (!a) {
+    /* Unknown client while home / other app FG: never map — Brave helpers used to
+       sneak above the shell via Map + Lower races. */
+    XUnmapWindow(dpy, e->window);
+    shell_raise_home();
     return;
   }
-  a->covered = 0;
-  XMapWindow(dpy, e->window);
-  XRaiseWindow(dpy, e->window);
-  XSetInputFocus(dpy, e->window, RevertToPointerRoot, CurrentTime);
 
-  Rect full = full_rect();
-  full.h = target_h;
-  rs_snap(&win_spring, full);
+  if (rs_busy(&win_spring) || gesture || (active_app == a && a->covered)) {
+    app_add_win(a, e->window);
+    a->covered = 1;
+    XSetWindowBorderWidth(dpy, e->window, 0);
+    XMoveResizeWindow(dpy, e->window, 0, 0, W, (unsigned)app_normal_h());
+    /* Map under the shell so Chromium keeps a live buffer; shell stays on top. */
+    XMapWindow(dpy, e->window);
+    XLowerWindow(dpy, e->window);
+    shell_raise_home();
+    return;
+  }
+
+  if (a->state == ST_FG && active_app == a)
+    manage_client_window(a, e->window);
+  else {
+    /* Background app (or home): track it, keep it hidden, shell stays on top. */
+    app_add_win(a, e->window);
+    XUnmapWindow(dpy, e->window);
+    shell_raise_home();
+  }
+}
+
+/* Override-redirect clients (Chromium FS popup / helpers) skip MapRequest; catch MapNotify.
+   Always adopt into the app first — a FG early-return used to orphan OR fullscreen windows. */
+static void on_map_notify(XMapEvent *e) {
+  if (e->window == shell || e->window == root || e->window == kbd_win || e->window == gesture_lane) return;
+  App *a = find_app_by_win(e->window);
+  if (!a) a = find_app_by_pid(window_pid(e->window));
+  if (!a) a = find_app_by_class(e->window);
+  if (a) {
+    app_add_win(a, e->window);
+    XSelectInput(dpy, e->window, StructureNotifyMask | PropertyChangeMask);
+  }
+
+  int fg = a && active_app == a && a->state == ST_FG && !a->covered && !switcher.open;
+  if (fg) {
+    /* Opacity-0 OR popup (Chromium FS/notification): hide — no compositor here. */
+    if (window_opacity_is_zero(e->window) || window_is_input_only(e->window)) {
+      XUnmapWindow(dpy, e->window);
+      gesture_lane_raise();
+      return;
+    }
+    /* OR / EWMH fullscreen: keep mapped but clamp off the gesture inset, then
+       put the lane back on top so home-swipe still works. */
+    if (!window_is_trivial(e->window)) {
+      Window rr; int x, y; unsigned ww, hh, b, d;
+      if (XGetGeometry(dpy, e->window, &rr, &x, &y, &ww, &hh, &b, &d)
+          && ((int)hh > app_normal_h() || window_looks_fullscreen(e->window)))
+        XMoveResizeWindow(dpy, e->window, 0, 0, W, (unsigned)app_normal_h());
+      if (window_looks_fullscreen(e->window) || window_has_fullscreen_state(e->window)) {
+        XRaiseWindow(dpy, e->window);
+        Window best = app_best_content_win(a);
+        if (best != None)
+          XSetInputFocus(dpy, best, RevertToPointerRoot, CurrentTime);
+      }
+    }
+    gesture_lane_raise();
+    return;
+  }
+  /* During a cover/swipe, keep the FG app's windows mapped under the shell. */
+  if (a && active_app == a && a->state == ST_FG && a->covered) {
+    XLowerWindow(dpy, e->window);
+    shell_raise_home();
+    return;
+  }
+  XUnmapWindow(dpy, e->window);
+  shell_raise_home();
+}
+
+/* True if this client may sit above the shell right now. */
+static int client_may_show(App *a, Window w) {
+  (void)w;
+  return a && active_app == a && a->state == ST_FG && !a->covered
+      && !switcher.open && !gesture && !rs_busy(&win_spring);
+}
+
+/* Covered FG app: stay mapped under the shell (content preserved). */
+static int client_cover_hold(App *a) {
+  return a && active_app == a && a->state == ST_FG && a->covered;
+}
+
+/* Unmap every root child that should not cover home / the FG app. Brave remaps
+   helpers for seconds after minimize; call before AND after draining X events. */
+static void home_enforce_stacking(void) {
+  if (edit_mode) return;
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  int hid = 0;
+  if (XQueryTree(dpy, root, &rr, &parent, &kids, &nk) && kids) {
+    for (unsigned i = 0; i < nk; i++) {
+      Window w = kids[i];
+      if (w == shell || w == kbd_win || w == gesture_lane) continue;
+      App *a = find_app_by_win(w);
+      if (!a) a = find_app_by_pid(window_pid(w));
+      if (!a) a = find_app_by_class(w);
+      if (a) app_add_win(a, w);
+      if (client_may_show(a, w)) continue;
+      if (client_cover_hold(a)) {
+        XLowerWindow(dpy, w);                /* keep buffers alive during swipe */
+        continue;
+      }
+      XWindowAttributes wa;
+      if (XGetWindowAttributes(dpy, w, &wa) && wa.map_state != IsUnmapped) {
+        XUnmapWindow(dpy, w);
+        hid = 1;
+      }
+    }
+    XFree(kids);
+  }
+  if (!active_app || hid || (active_app && active_app->covered)) shell_raise_home();
+  else if (active_app) gesture_lane_raise();
 }
 
 static void on_configure_request(XConfigureRequestEvent *e) {
@@ -4307,18 +5420,39 @@ static void on_configure_request(XConfigureRequestEvent *e) {
   wc.width = e->width;
   wc.height = e->height;
   wc.border_width = 0;
-  e->value_mask |= CWBorderWidth;
+  unsigned long mask = e->value_mask | CWBorderWidth;
   wc.sibling = e->above;
   wc.stack_mode = e->detail;
 
+  int raised_lane = 0;
   if (e->window == kbd_win) {
     wc.x = 0;
-    wc.y = (int)lround(H * 0.75);
+    wc.y = (int)lround(H * 0.65);
     wc.width = W;
     wc.height = H - wc.y;
+    mask |= CWX | CWY | CWWidth | CWHeight;
+  } else {
+    App *a = find_app_by_win(e->window);
+    if (!a) a = find_app_by_pid(window_pid(e->window));
+    if (!a) a = find_app_by_class(e->window);
+    int fg = client_may_show(a, e->window);
+    /* Chromium/Brave keep sending CWStackMode Above after "home"; honoring that
+       put their windows on top of the shell. Only the foreground app may restack. */
+    if (!fg) mask &= ~(CWSibling | CWStackMode);
+    if (fg && !window_is_trivial(e->window)) {
+      /* Cap at content height — fullscreen must not cover the gesture bar. */
+      wc.x = 0; wc.y = 0;
+      wc.width = W;
+      wc.height = app_normal_h();
+      mask |= CWX | CWY | CWWidth | CWHeight;
+      mask &= ~(CWSibling | CWStackMode);
+      raised_lane = 1;
+    }
   }
 
-  XConfigureWindow(dpy, e->window, e->value_mask, &wc);
+  XConfigureWindow(dpy, e->window, mask, &wc);
+  if (raised_lane) gesture_lane_raise();
+  if (!active_app || e->window == kbd_win) shell_raise_home();
 }
 
 static void on_unmap_notify(XUnmapEvent *e) {
@@ -4398,14 +5532,60 @@ static void on_destroy_notify(XDestroyWindowEvent *e) {
 
 /* ------------------------------------------------------------------------ */
 /* MAIN                                                                     */
-/* The root window changed size (RandR rotation). Everything sized to the old screen is rebuilt. */
-static void screen_resized(int nw, int nh) {
-  if (nw <= 0 || nh <= 0 || (nw == W && nh == H)) return;
+/* Root geometry helpers. Do NOT use DisplayWidth/Height after RandR: those
+   macros stay stale until XRRUpdateConfiguration, and a poll that trusts them
+   will snap the shell back to landscape while the framebuffer is portrait. */
+static int root_size(int *ow, int *oh) {
+  Window rr; int x, y; unsigned w, h, b, d;
+  if (!XGetGeometry(dpy, root, &rr, &x, &y, &w, &h, &b, &d) || w < 2 || h < 2) return 0;
+  *ow = (int)w; *oh = (int)h;
+  return 1;
+}
+
+static int shell_size(int *ow, int *oh) {
+  if (shell == None) return 0;
+  Window rr; int x, y; unsigned w, h, b, d;
+  if (!XGetGeometry(dpy, shell, &rr, &x, &y, &w, &h, &b, &d)) return 0;
+  *ow = (int)w; *oh = (int)h;
+  return 1;
+}
+
+/* The root window changed size (RandR rotation). Everything sized to the old screen is rebuilt.
+   force=1 also runs when W/H already match but the shell X window does not. */
+static void screen_resized_ex(int nw, int nh, int force) {
+  if (nw <= 0 || nh <= 0) return;
+  int eff_h = kbd_active ? (int)lround(nh * 0.65) : nh;
+  int sw = 0, sh = 0, shell_ok = shell_size(&sw, &sh) && sw == nw && sh == eff_h;
+  if (!force && nw == W && nh == H && shell_ok) return;
+
+  fprintf(stderr, "summerboard: screen_resized %dx%d -> %dx%d (shell was %dx%d, want %dx%d)%s\n",
+          W, H, nw, nh, sw, sh, nw, eff_h, force ? " [force]" : "");
+
   W = nw; H = nh;
-  int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
-  XResizeWindow(dpy, shell, (unsigned)W, (unsigned)eff_h);
+  /* Same formula as startup so icon/font scale stays sane across portrait/landscape. */
+  UI = fmax(1.0, fmin((double)fmax(W, H) / 1024.0, (double)fmin(W, H) / 768.0));
+  eff_h = kbd_active ? (int)lround(H * 0.65) : H;
+
+  /* Unmap during resize so Mesa/EGL cannot keep a stale landscape surface mapped. */
+  XUnmapWindow(dpy, shell);
+  XMoveResizeWindow(dpy, shell, 0, 0, (unsigned)W, (unsigned)eff_h);
   if (kbd_win != None) XMoveResizeWindow(dpy, kbd_win, 0, eff_h, (unsigned)W, (unsigned)(H - eff_h));
+  XSync(dpy, False);
+
+  /* Retry if the server ignored the first configure (seen on modesetting+glamor). */
+  for (int try = 0; try < 3; try++) {
+    int cw = 0, ch = 0;
+    if (shell_size(&cw, &ch) && cw == W && ch == eff_h) break;
+    fprintf(stderr, "summerboard: shell resize retry %d (have %dx%d)\n", try, cw, ch);
+    XMoveResizeWindow(dpy, shell, 0, 0, (unsigned)W, (unsigned)eff_h);
+    XSync(dpy, False);
+  }
+
   gl_resize();
+  XMapWindow(dpy, shell);
+  XRaiseWindow(dpy, shell);
+  if (kbd_win != None) XRaiseWindow(dpy, kbd_win);
+  gesture_lane_ensure();
   layout_grid();
   sp_snap(&page_offset_spring, current_page * (double)W);
   rs_snap(&dock_spring, dock_box);
@@ -4428,6 +5608,20 @@ static void screen_resized(int nw, int nh) {
     else if (apps[i].snap.tex) snap_drop(&apps[i]);
   }
   XSync(dpy, False);
+}
+
+static void screen_resized(int nw, int nh) { screen_resized_ex(nw, nh, 0); }
+
+/* Poll live root geometry (XGetGeometry), never DisplayWidth/Height after RandR. */
+static int screen_size_poll(void) {
+  int nw = 0, nh = 0;
+  if (!root_size(&nw, &nh)) return 0;
+  int eff_h = kbd_active ? (int)lround(nh * 0.65) : nh;
+  int sw = 0, sh = 0;
+  int shell_bad = !shell_size(&sw, &sh) || sw != nw || sh != eff_h;
+  if (nw == W && nh == H && !shell_bad) return 0;
+  screen_resized_ex(nw, nh, shell_bad);
+  return 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -4474,6 +5668,8 @@ int main(int argc, char **argv) {
 
   XSync(dpy, False);                     /* surfaces BadAccess if another WM is running */
   XSetErrorHandler(wm_error_handler);
+  ewmh_init();                           /* advertise FULLSCREEN so clients use EWMH, not only OR */
+  gesture_lane_ensure();                 /* home-gesture hit target above any FS client */
 
   if (!gl_init(&shell)) {
     fprintf(stderr, "summerboard: OpenGL initialisation failed (is Mesa / GLX available?)\n");
@@ -4500,6 +5696,9 @@ int main(int argc, char **argv) {
   sp_init(&switcher_scroll_spring, 0.0, 260, 27, 0.05);
   sp_init(&page_offset_spring, 0.0, 260, 28, 0.05);
 
+  gyro_probe();
+  gyro_warmup();
+
   double last_time = now_ms();
   int xfd = ConnectionNumber(dpy);
   home_button_init();
@@ -4513,15 +5712,23 @@ int main(int argc, char **argv) {
 
   while (1) {
     if (home_button_poll()) dirty = 1;
+    if (screen_size_poll()) dirty = 1;       /* recover if RandR skipped ConfigureNotify */
     while (XPending(dpy)) {
       XEvent ev;
       XNextEvent(dpy, &ev);
       switch (ev.type) {
         case ConfigureNotify:
-          if (ev.xconfigure.window == root) { screen_resized(ev.xconfigure.width, ev.xconfigure.height); dirty = 1; }
+          if (ev.xconfigure.window == root || ev.xconfigure.window == shell) {
+            /* Prefer live root geometry: DisplayWidth and some ConfigureNotify
+               sizes stay stale across RandR and used to snap us back to landscape. */
+            if (screen_size_poll()) dirty = 1;
+          }
           break;
         case MapRequest: on_map_request(&ev.xmaprequest); dirty = 1; break;
+        case MapNotify: on_map_notify(&ev.xmap); dirty = 1; break;
         case ConfigureRequest: on_configure_request(&ev.xconfigurerequest); break;
+        case ClientMessage: on_client_message(&ev.xclient); dirty = 1; break;
+        case PropertyNotify: on_property_notify(&ev.xproperty); break;
         case UnmapNotify: on_unmap_notify(&ev.xunmap); dirty = 1; break;
         case DestroyNotify: on_destroy_notify(&ev.xdestroywindow); dirty = 1; break;
         case Expose: dirty = 1; break;
@@ -4549,15 +5756,22 @@ int main(int argc, char **argv) {
           break;
       }
     }
+    /* After MapRequest handling: Brave often remaps in the same burst we just drained. */
+    home_enforce_stacking();
 
     int geom_wait = geom_flush_pending();   /* deliver the final throttled size */
+    /* Background browsers keep remapping; wake periodically to re-hide them. */
+    int bg_clients = 0;
+    for (int i = 0; i < app_count; i++)
+      if (apps[i].state == ST_BG && !apps[i].builtin) bg_clients = 1;
     /* Nothing changed and nothing is animating: sleep until the next X event. */
     if (!dirty && !anim_active() && !geom_wait) {
       XFlush(dpy);
       fd_set idle_fds; FD_ZERO(&idle_fds); FD_SET(xfd, &idle_fds);
       int nfds = xfd;
       if (home_fd >= 0) { FD_SET(home_fd, &idle_fds); if (home_fd > nfds) nfds = home_fd; }
-      select(nfds + 1, &idle_fds, NULL, NULL, NULL);
+      struct timeval idle_tv = { .tv_sec = 0, .tv_usec = bg_clients ? 200000 : 0 };
+      select(nfds + 1, &idle_fds, NULL, NULL, bg_clients ? &idle_tv : NULL);
       last_time = now_ms() - 16.0;   /* don't feed a huge dt into the springs after idling */
       next_frame = 0;
       continue;
@@ -4611,7 +5825,7 @@ int main(int argc, char **argv) {
     drag_tick(now);
     finalize_removals();
 
-    int eff_h = kbd_active ? (int)lround(H * 0.75) : H;
+    int eff_h = kbd_active ? (int)lround(H * 0.65) : H;
     if (gesture && strcmp(gesture->mode, "drag") == 0 && !gesture->hold_fired
         && gesture->py < eff_h * 0.85
         && (now - gesture->last_move_t) > (active_app ? 450.0 : 60.0)) {

@@ -917,12 +917,42 @@ static int x_image_create(Visual *vis, int depth) {
   return 1;
 }
 
+/* Recreate the EGL window surface after RandR. Mesa/i915 often leaves a stale
+   surface size after xrandr --rotate, which presents as a black screen until
+   the surface is destroyed and created again on the resized X window. */
+static int egl_recreate_window_surface(Window win) {
+  if (!present_egl || win == None) return 0;
+  EGLint iv = 0;
+  { const char *ev = getenv("SUMMERBOARD_VSYNC"); iv = (ev && ev[0] == '1') ? 1 : 0; }
+  eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_ctx);
+  if (egl_win_surf != EGL_NO_SURFACE) {
+    eglDestroySurface(egl_dpy, egl_win_surf);
+    egl_win_surf = EGL_NO_SURFACE;
+  }
+  XSync(dpy, False);
+  egl_win_surf = eglCreateWindowSurface(egl_dpy, egl_cfg, win, NULL);
+  if (egl_win_surf == EGL_NO_SURFACE) {
+    fprintf(stderr, "summerboard: eglCreateWindowSurface after resize failed (0x%x)\n", eglGetError());
+    return 0;
+  }
+  if (!eglMakeCurrent(egl_dpy, egl_win_surf, egl_win_surf, egl_ctx)) {
+    fprintf(stderr, "summerboard: eglMakeCurrent after resize failed (0x%x)\n", eglGetError());
+    return 0;
+  }
+  eglSwapInterval(egl_dpy, iv);
+  return 1;
+}
+
 /* The screen changed size (rotation). W and H are already the new values and the shell window has been
    resized; rebuild everything that was allocated at the old size. */
 static void gl_resize(void) {
   scr_aw = W; scr_ah = H;
-  if (present_egl && egl_direct) return;       /* the window surface follows the window; nothing else is sized to the screen */
-  scr_ready = 0;                               /* gl_begin_frame rebuilds the offscreen targets at the new size */
+  scr_ready = 0;                               /* gl_begin_frame rebuilds offscreen targets / viewport */
+  if (present_egl) {
+    /* Always recreate the window surface: egl_direct used to skip this and went black after rotate. */
+    if (shell != None) egl_recreate_window_surface(shell);
+    if (egl_direct) return;                  /* no offscreen FBO in the direct path */
+  }
   if (gl_screen.fbo) img_free(&gl_screen);
   if (gl_swz.fbo) img_free(&gl_swz);
   if (!present_egl && x_img) {
@@ -963,7 +993,7 @@ static int gl_setup(Window *out_win) {
   swa.background_pixmap = None;
   swa.border_pixel = 0;
   swa.override_redirect = True;
-  swa.event_mask = ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
+  swa.event_mask = ExposureMask | StructureNotifyMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
   unsigned long vm = CWBackPixmap | CWBorderPixel | CWOverrideRedirect | CWEventMask;
   if (cm) { swa.colormap = cm; vm |= CWColormap; }
   *out_win = XCreateWindow(dpy, root, 0, 0, W, H, 0, depth, InputOutput, vis, vm, &swa);
