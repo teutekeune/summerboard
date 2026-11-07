@@ -1,0 +1,73 @@
+#!/bin/sh
+# Summerboard / HP Stream x360 orientation helper.
+# Usage: rotate                 -> print current (normal|inverted|left|right)
+#        rotate <orientation>   -> xrandr + touch Coordinate Transformation Matrix
+set -e
+export DISPLAY="${DISPLAY:-:0}"
+export PATH="/usr/bin:/bin:/usr/local/bin:${PATH}"
+
+OUTPUT=$(xrandr --query 2>/dev/null | awk '/ connected/{print $1; exit}')
+[ -n "$OUTPUT" ] || OUTPUT=eDP-1
+
+TOUCH=
+if xinput list --name-only 2>/dev/null | grep -qx "SYNA7813:00 06CB:16DE"; then
+  TOUCH=$(xinput list --id-only "SYNA7813:00 06CB:16DE" 2>/dev/null || true)
+fi
+if [ -z "$TOUCH" ]; then
+  for id in $(xinput list --id-only 2>/dev/null); do
+    name=$(xinput list --name-only "$id" 2>/dev/null || true)
+    case "$name" in *Virtual*|*XTEST*) continue ;; esac
+    if xinput list-props "$id" 2>/dev/null | grep -q "Coordinate Transformation Matrix"; then
+      TOUCH=$id
+      break
+    fi
+  done
+fi
+
+current() {
+  line=$(xrandr --query 2>/dev/null | awk -v o="$OUTPUT" '$1==o && / connected/{print; exit}')
+  line=$(printf '%s\n' "$line" | sed 's/([^)]*)//g')
+  case " $line " in
+    *" inverted "*) echo inverted ;;
+    *" left "*)     echo left ;;
+    *" right "*)    echo right ;;
+    *)              echo normal ;;
+  esac
+}
+
+# CTM maps touch device coords into the (possibly rotated) screen.
+# Keep libinput Rotation Angle at 0 so we do not double-rotate.
+apply_touch() {
+  [ -n "$TOUCH" ] || return 0
+  case "$1" in
+    normal)
+      ctm="1 0 0 0 1 0 0 0 1" ;;
+    left)     # CCW 90 / xrandr left
+      ctm="0 -1 1 1 0 0 0 0 1" ;;
+    inverted)
+      ctm="-1 0 1 0 -1 1 0 0 1" ;;
+    right)    # CW 90 / xrandr right
+      ctm="0 1 0 -1 0 1 0 0 1" ;;
+    *) return 1 ;;
+  esac
+  # shellcheck disable=SC2086
+  xinput set-prop "$TOUCH" "Coordinate Transformation Matrix" $ctm 2>/dev/null || true
+  xinput set-prop "$TOUCH" "libinput Rotation Angle" 0 2>/dev/null || true
+}
+
+if [ $# -eq 0 ]; then
+  current
+  exit 0
+fi
+
+ori=$1
+case "$ori" in
+  normal|inverted|left|right) ;;
+  *) echo "usage: rotate [normal|inverted|left|right]" >&2; exit 2 ;;
+esac
+
+cur=$(current)
+if [ "$cur" != "$ori" ]; then
+  xrandr --output "$OUTPUT" --rotate "$ori"
+fi
+apply_touch "$ori"

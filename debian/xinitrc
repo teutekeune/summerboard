@@ -1,0 +1,8 @@
+#!/bin/sh
+# Summerboard X session (startx → no display manager).
+export SUMMERBOARD_DIR="${SUMMERBOARD_DIR:-$HOME/summerboard}"
+export SUMMERBOARD_PRESENT=egl
+export LIBGL_DRI3_DISABLE=0
+# Leave MESA_LOADER_DRIVER_OVERRIDE unset so Debian Mesa picks the right Gallium driver.
+cd "$SUMMERBOARD_DIR" || true
+exec /usr/local/bin/summerboard

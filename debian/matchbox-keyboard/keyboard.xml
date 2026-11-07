@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<keyboard>
+<!-- Summerboard QWERTY with number row (digits were missing from Debian default). -->
+<options>
+</options>
+<layout id="Summerboard QWERTY">
+    <include file="numbers-fragment.xml"/>
+    <include file="base-fragment.xml"/>
+</layout>
+</keyboard>

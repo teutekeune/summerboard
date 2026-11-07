@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<fragment>
+    <!-- Digit row for Summerboard / HP Stream (Debian default keyboard.xml omitted this). -->
+    <row>
+        <key>
+            <default display="1" />
+            <shifted display="!" />
+        </key>
+        <key>
+            <default display="2" />
+            <shifted display="@" />
+        </key>
+        <key>
+            <default display="3" />
+            <shifted display="#" />
+        </key>
+        <key>
+            <default display="4" />
+            <shifted display="$" />
+        </key>
+        <key>
+            <default display="5" />
+            <shifted display="%" />
+        </key>
+        <key>
+            <default display="6" />
+            <shifted display="^" />
+        </key>
+        <key>
+            <default display="7" />
+            <shifted display="&amp;" />
+        </key>
+        <key>
+            <default display="8" />
+            <shifted display="*" />
+        </key>
+        <key>
+            <default display="9" />
+            <shifted display="(" />
+        </key>
+        <key>
+            <default display="0" />
+            <shifted display=")" />
+        </key>
+    </row>
+</fragment>
