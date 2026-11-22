@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <stdio.h>
@@ -63,6 +64,19 @@ int main(void) {
   int out = open_uinput();
   if (out < 0) return 0;
   usleep(200000);
+  /* The new device comes up with an identity matrix. If the screen is
+     already rotated, ask `rotate` to put the same matrix on it that the
+     panel uses. Later turns go through `rotate` as well. */
+  {
+    pid_t p = fork();
+    if (p == 0) {
+      execl("/bin/sh", "sh", "-c",
+            "PATH=/usr/local/bin:$PATH; o=$(rotate); [ -n \"$o\" ] && rotate \"$o\"",
+            (char *)NULL);
+      _exit(0);
+    }
+    if (p > 0) waitpid(p, NULL, 0);
+  }
   if (ioctl(src, EVIOCGRAB, 1) < 0) {
     ioctl(out, UI_DEV_DESTROY);
     return 0;
