@@ -9,21 +9,6 @@ export PATH="/usr/bin:/bin:/usr/local/bin:${PATH}"
 OUTPUT=$(xrandr --query 2>/dev/null | awk '/ connected/{print $1; exit}')
 [ -n "$OUTPUT" ] || OUTPUT=eDP-1
 
-TOUCH=
-if xinput list --name-only 2>/dev/null | grep -qx "SYNA7813:00 06CB:16DE"; then
-  TOUCH=$(xinput list --id-only "SYNA7813:00 06CB:16DE" 2>/dev/null || true)
-fi
-if [ -z "$TOUCH" ]; then
-  for id in $(xinput list --id-only 2>/dev/null); do
-    name=$(xinput list --name-only "$id" 2>/dev/null || true)
-    case "$name" in *Virtual*|*XTEST*) continue ;; esac
-    if xinput list-props "$id" 2>/dev/null | grep -q "Coordinate Transformation Matrix"; then
-      TOUCH=$id
-      break
-    fi
-  done
-fi
-
 current() {
   line=$(xrandr --query 2>/dev/null | awk -v o="$OUTPUT" '$1==o && / connected/{print; exit}')
   line=$(printf '%s\n' "$line" | sed 's/([^)]*)//g')
@@ -37,8 +22,11 @@ current() {
 
 # CTM maps touch device coords into the (possibly rotated) screen.
 # Keep libinput Rotation Angle at 0 so we do not double-rotate.
+# The real panel is grabbed by touch-tap, which re-emits events on
+# "Summerboard Touch". Rotating only the panel leaves that device in
+# landscape, so a portrait swipe from the bottom arrives as a swipe
+# from the side. Set the matrix on every touch device.
 apply_touch() {
-  [ -n "$TOUCH" ] || return 0
   case "$1" in
     normal)
       ctm="1 0 0 0 1 0 0 0 1" ;;
@@ -50,9 +38,16 @@ apply_touch() {
       ctm="0 1 0 -1 0 1 0 0 1" ;;
     *) return 1 ;;
   esac
-  # shellcheck disable=SC2086
-  xinput set-prop "$TOUCH" "Coordinate Transformation Matrix" $ctm 2>/dev/null || true
-  xinput set-prop "$TOUCH" "libinput Rotation Angle" 0 2>/dev/null || true
+  for id in $(xinput list --id-only 2>/dev/null); do
+    name=$(xinput list --name-only "$id" 2>/dev/null || true)
+    case "$name" in
+      *SYNA7813*|*Summerboard*|*Touchscreen*|*touchscreen*|*Digitizer*|*digitizer*) ;;
+      *) continue ;;
+    esac
+    # shellcheck disable=SC2086
+    xinput set-prop "$id" "Coordinate Transformation Matrix" $ctm 2>/dev/null || true
+    xinput set-prop "$id" "libinput Rotation Angle" 0 2>/dev/null || true
+  done
 }
 
 if [ $# -eq 0 ]; then
