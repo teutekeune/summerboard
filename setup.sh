@@ -224,12 +224,28 @@ build_summerboard() {
   local out="$ROOT/summerboard"
   cc "$src" -o "$out" \
     -O2 -I/usr/include/freetype2 \
-    -lX11 -lXext -lXfixes -lEGL -lGL -lfreetype -lm \
+    -lX11 -lXext -lXfixes -lXrandr -lEGL -lGL -lfreetype -lm \
     || die "compile failed"
 
   run install -m 755 "$out" "$BIN_DIR/summerboard"
   run install -m 755 "$ROOT/rotate" "$BIN_DIR/rotate"
   log "  installed $BIN_DIR/summerboard and $BIN_DIR/rotate"
+
+  # Touch-tap holds a finger still inside small buttons. libqt-drag.so is
+  # optional and only preloaded when the file is present.
+  run mkdir -p "$ASSETS_DIR"
+  if [ -f "$ROOT/touch-tap.c" ]; then
+    cc -O2 -o "$ROOT/touch-tap" "$ROOT/touch-tap.c" || die "touch-tap compile failed"
+    run install -m 755 "$ROOT/touch-tap" "$ASSETS_DIR/touch-tap"
+  fi
+  if [ -f "$ROOT/qt-drag.c" ]; then
+    cc -shared -fPIC -O2 -o "$ROOT/libqt-drag.so" "$ROOT/qt-drag.c" || die "qt-drag compile failed"
+    run install -m 755 "$ROOT/libqt-drag.so" "$ASSETS_DIR/libqt-drag.so"
+  fi
+  if [ -f "$ROOT/debian/udev/99-summerboard-uinput.rules" ]; then
+    run install -m 644 "$ROOT/debian/udev/99-summerboard-uinput.rules" \
+      /etc/udev/rules.d/99-summerboard-uinput.rules
+  fi
 }
 
 install_assets() {
@@ -360,7 +376,7 @@ To rebuild later from this tree:
 
   cc summerboardv28_gl.c -o summerboard \\
     -I/usr/include/freetype2 \\
-    -lX11 -lXext -lXfixes -lEGL -lGL -lfreetype -lm
+    -lX11 -lXext -lXfixes -lXrandr -lEGL -lGL -lfreetype -lm
   sudo install -m 755 summerboard /usr/local/bin/summerboard
 ----------------------------------------------------------------------
 EOF

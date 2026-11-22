@@ -7,7 +7,7 @@
  *   cc summerboardv28_gl.c -o summerboard \
  *     -I/usr/local/lib/sgx-mesa/include -I/usr/include/freetype2 \
  *     -L/usr/local/lib/sgx-mesa/lib \
- *     -lX11 -lXext -lXfixes -lEGL -lGL -lfreetype -lm
+ *     -lX11 -lXext -lXfixes -lXrandr -lEGL -lGL -lfreetype -lm
  *
  * Keep nanosvg.h and nanosvgrast.h next to this file, and the WhiteSur icon theme under
  * ./summerboard/WhiteSur (or set SUMMERBOARD_DIR).
@@ -29,6 +29,11 @@
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/shape.h>
+/* Xrandr pulls in Xrender, which typedefs Glyph. Summerboard has its own. */
+#define Glyph X11GlyphId
+#include <X11/extensions/Xrandr.h>
+#undef Glyph
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -491,6 +496,10 @@ static pid_t window_pid(Window w);
 static void shell_raise_home(void);
 static void home_enforce_stacking(void);
 static int window_is_trivial(Window w);
+static int window_dialog_geom(Window w, int *ox, int *oy, int *ow, int *oh);
+static int window_owns_colormap(Window w);
+static int window_is_sdl_host(Window w);
+static void game_route_clicks(App *a);
 static int window_has_fullscreen_state(Window w);
 static int window_looks_fullscreen(Window w);
 static int window_opacity_is_zero(Window w);
@@ -501,6 +510,19 @@ static void app_hide_invisible_overlays(App *a);
 static Window app_best_content_win(App *a);
 static int app_normal_h(void);
 static int client_may_show(App *a, Window w);
+static int client_cover_hold(App *a, Window w);
+static Window window_frame_parent(Window w);
+static int window_skip_place(Window w);
+static int window_keeps_own_size(Window w);
+static int window_is_splash(Window w);
+static int window_own_geom(Window w, int *ox, int *oy, int *ow, int *oh);
+static void app_bury_splash(App *a);
+static void app_place_popups(App *a);
+static int window_target_geom(App *a, Window w, int *ox, int *oy, int *ow, int *oh);
+static void window_install_colormap(Window w);
+static void app_ensure_placed(App *a);
+static int app_show_nested(App *a);
+static int root_hosts_visible_app(Window w);
 static void gesture_lane_ensure(void);
 static void gesture_lane_raise(void);
 
@@ -1478,35 +1500,34 @@ static Rect geom_pending_rect;
 static void sync_window_geometry_ex(App *a, Rect r, int force) {
   if (!a || a->nwin == 0) return;
 
-  int eff_h = shell_band_h();
-  if (r.h >= eff_h - 1) {
-    r.h = eff_h - (int)lround(S(12));
-  }
-
-  int x = (int)lround(r.x), y = (int)lround(r.y);
-  int w = (int)fmax(1, lround(r.w)), h = (int)fmax(1, lround(r.h));
   double now = now_ms();
   int throttled = 0;
 
   for (int i = 0; i < a->nwin; i++) {
+    /* GoldSrc reparents its drawable into an override-redirect frame, and the
+       Hl_linux host must stay the size the game picked. Everything else is
+       placed explicitly (content area, or a real dialog). */
+    if (window_skip_place(a->wins[i])) continue;
+    int xi, yi, wi, hi;
+    if (!window_target_geom(a, a->wins[i], &xi, &yi, &wi, &hi)) continue;
     int known = (a->sent_win[i] == a->wins[i]);
-    if (known && a->sent_x[i] == x && a->sent_y[i] == y && a->sent_w[i] == w && a->sent_h[i] == h)
+    if (known && a->sent_x[i] == xi && a->sent_y[i] == yi && a->sent_w[i] == wi && a->sent_h[i] == hi)
       continue;
 
-    int size_changed = !known || a->sent_w[i] != w || a->sent_h[i] != h;
+    int size_changed = !known || a->sent_w[i] != wi || a->sent_h[i] != hi;
     if (size_changed && !force && known && now - a->last_resize_ms < RESIZE_MIN_MS) {
       throttled = 1;
-      if (a->sent_x[i] != x || a->sent_y[i] != y) {
-        XMoveWindow(dpy, a->wins[i], x, y);
-        a->sent_x[i] = x; a->sent_y[i] = y;
+      if (a->sent_x[i] != xi || a->sent_y[i] != yi) {
+        XMoveWindow(dpy, a->wins[i], xi, yi);
+        a->sent_x[i] = xi; a->sent_y[i] = yi;
       }
       continue;
     }
 
-    if (size_changed) XMoveResizeWindow(dpy, a->wins[i], x, y, (unsigned)w, (unsigned)h);
-    else              XMoveWindow(dpy, a->wins[i], x, y);
+    if (size_changed) XMoveResizeWindow(dpy, a->wins[i], xi, yi, (unsigned)wi, (unsigned)hi);
+    else              XMoveWindow(dpy, a->wins[i], xi, yi);
     a->sent_win[i] = a->wins[i];
-    a->sent_x[i] = x; a->sent_y[i] = y; a->sent_w[i] = w; a->sent_h[i] = h;
+    a->sent_x[i] = xi; a->sent_y[i] = yi; a->sent_w[i] = wi; a->sent_h[i] = hi;
     if (size_changed) a->last_resize_ms = now;
   }
 
@@ -1530,6 +1551,16 @@ static void grab_snapshot(App *a);
 static void builtin_enter(App *a, int fresh);
 static void builtin_leave(App *a);
 static void builtin_close(App *a);
+static void settings_snapshot(App *a);
+
+/* Helpers live beside the assets: $SUMMERBOARD_DIR, else ~/summerboard. */
+static void summerboard_helper(char *out, size_t n, const char *name) {
+  const char *dir = getenv("SUMMERBOARD_DIR");
+  const char *home = getenv("HOME");
+  if (dir && dir[0]) snprintf(out, n, "%s/%s", dir, name);
+  else if (home && home[0]) snprintf(out, n, "%s/summerboard/%s", home, name);
+  else snprintf(out, n, "%s", name);
+}
 
 static void app_spawn(App *a) {
   if (!a->cmd[0]) return;
@@ -1540,6 +1571,9 @@ static void app_spawn(App *a) {
   if (a->pid == 0) {
     setsid();
     setenv("DISPLAY", target_disp, 1);
+    char preload[512];
+    summerboard_helper(preload, sizeof preload, "libqt-drag.so");
+    if (access(preload, R_OK) == 0) setenv("LD_PRELOAD", preload, 0);
 
     char full_shell_cmd[512];
     snprintf(full_shell_cmd, sizeof(full_shell_cmd), "DISPLAY=%s exec %s", target_disp, a->cmd);
@@ -1584,6 +1618,12 @@ static void gesture_lane_ensure(void) {
 
 static void gesture_lane_raise(void) {
   if (gesture_lane == None) return;
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  if (XQueryTree(dpy, root, &rr, &parent, &kids, &nk) && kids) {
+    int top = nk > 0 && kids[nk - 1] == gesture_lane;
+    XFree(kids);
+    if (top) return;
+  }
   XRaiseWindow(dpy, gesture_lane);
 }
 
@@ -1601,8 +1641,49 @@ static int app_add_win(App *a, Window w) {
   return 1;
 }
 
+/* Dialog, not a main window. GoldSrc "Warning" is 331x127. A medium default
+   such as 800x600 (Krita and friends) is a main window and must not be centered. */
+/* GoldSrc's warning (~331x127) is small on both axes and stays centered.
+   A main window that simply never maximized — Krita's 570x537 welcome,
+   an 800x600 SDL window — is not a dialog, even when PMaxSize repeats
+   that size. One large axis is enough to fill the content area. */
+static int hints_are_dialog(const XSizeHints *h) {
+  if (!(h->flags & PMaxSize)) return 0;
+  if (h->max_width < 64 || h->max_height < 32) return 0;
+  int band = app_normal_h();
+  if (band < 1) band = 1;
+  if (h->max_width > W - 8 || h->max_height > band - 8) return 0;
+  int narrow = h->max_width * 100 <= W * 50;
+  int squat = h->max_height * 100 <= band * 50;
+  return narrow && squat;
+}
+
+static int window_dialog_geom(Window w, int *ox, int *oy, int *ow, int *oh) {
+  XSizeHints h;
+  long sup = 0;
+  memset(&h, 0, sizeof h);
+  if (!XGetWMNormalHints(dpy, w, &h, &sup) || !hints_are_dialog(&h)) return 0;
+  *ow = h.max_width;
+  *oh = h.max_height;
+  if ((h.flags & (USSize | PSize)) && h.width >= 64 && h.width <= h.max_width) *ow = h.width;
+  if ((h.flags & (USSize | PSize)) && h.height >= 32 && h.height <= h.max_height) *oh = h.height;
+  int band = app_normal_h();
+  if ((h.flags & (USPosition | PPosition)) && h.x >= 0 && h.y >= 0
+      && h.x + *ow <= W && h.y + *oh <= band) {
+    *ox = h.x;
+    *oy = h.y;
+  } else {
+    *ox = (W - *ow) / 2;
+    *oy = (band - *oh) / 2;
+    if (*ox < 0) *ox = 0;
+    if (*oy < 0) *oy = 0;
+  }
+  return 1;
+}
+
 static void app_raise(App *a) {
-  int target_h = app_normal_h();
+  Window dialogs[MAX_WINS];
+  int nd = 0;
   /* Raise small → large so the content window ends on top (not a late transient). */
   int order[MAX_WINS];
   unsigned area[MAX_WINS];
@@ -1633,19 +1714,40 @@ static void app_raise(App *a) {
       XUnmapWindow(dpy, w);
       continue;
     }
-    /* Even with _NET_WM_STATE_FULLSCREEN, never cover the gesture inset. */
-    if (!window_is_trivial(w))
-      XMoveResizeWindow(dpy, w, 0, 0, W, (unsigned)target_h);
-    else
-      XMoveWindow(dpy, w, 0, 0);
+    /* Nested under the client's mode window: fitting it to the shell clips to black. */
+    if (window_skip_place(w)) continue;
+    {
+      int dx, dy, dw, dh;
+      int dialog = window_dialog_geom(w, &dx, &dy, &dw, &dh);
+      /* Configure before map so SDL's XIfEvent(MapNotify) wakes on a real size. */
+      if (dialog || window_target_geom(a, w, &dx, &dy, &dw, &dh)) {
+        XMoveResizeWindow(dpy, w, dx, dy, (unsigned)dw, (unsigned)dh);
+        if (dialog && nd < MAX_WINS) dialogs[nd++] = w;
+        if (window_owns_colormap(w)) window_install_colormap(w);
+      }
+    }
     XMapWindow(dpy, w);
     XRaiseWindow(dpy, w);
-    /* Nudge clients that cleared their buffer while unmapped/obscured (Brave). */
-    XClearArea(dpy, w, 0, 0, 0, 0, True);
+    /* Nudge clients that cleared their buffer while unmapped/obscured (Brave).
+       Never clear a private-colormap window: that wipes the only frame it drew. */
+    if (!window_owns_colormap(w) && !window_is_sdl_host(w))
+      XClearArea(dpy, w, 0, 0, 0, 0, True);
   }
   app_hide_invisible_overlays(a);
+  app_bury_splash(a);
+  app_show_nested(a);
+  for (int i = 0; i < nd; i++) { XMapWindow(dpy, dialogs[i]); XRaiseWindow(dpy, dialogs[i]); }
   gesture_lane_raise();
-  Window focus = app_best_content_win(a);
+  game_route_clicks(a);
+  Window focus = nd ? dialogs[nd - 1] : None;
+  if (focus == None) {
+    for (int i = 0; i < a->nwin; i++)
+      if (window_owns_colormap(a->wins[i]) && !window_is_trivial(a->wins[i])) {
+        focus = a->wins[i];
+        break;
+      }
+  }
+  if (focus == None) focus = app_best_content_win(a);
   XSetInputFocus(dpy, focus != None ? focus : shell, RevertToPointerRoot, CurrentTime);
   if (focus != None && atom_net_active_window)
     XChangeProperty(dpy, root, atom_net_active_window, XA_WINDOW, 32,
@@ -1722,7 +1824,7 @@ static void launch(App *a) {
   if (fresh || !a->snap.tex) snap_drop(a);   /* a running app keeps its snapshot for the flight */
   a->state = ST_FG;
   active_app = a;
-  flight_app = a->builtin ? NULL : a;
+  flight_app = a;
   rs_snap(&win_spring, icon_rect(a));
 
   Rect target = full_rect();
@@ -1738,6 +1840,7 @@ static void launch(App *a) {
   if (a->builtin) {
     a->covered = 0;
     builtin_enter(a, fresh);
+    settings_snapshot(a);          /* the flight shows this picture, not a squashed live page */
   } else {
     app_adopt_existing(a);                   /* reuse Brave/etc. windows still on the server */
     if (a->nwin > 0) {
@@ -1752,7 +1855,8 @@ static void launch(App *a) {
 
 static void minimize_to_icon(App *a, double vx, double vy) {
   a->state = ST_BG;
-  flight_app = a->builtin ? NULL : a;   /* keep drawing the window while it flies home */
+  flight_app = a;   /* keep drawing the window while it flies home */
+  if (a->builtin) settings_snapshot(a);   /* current page, before the sheet is dismissed */
   if (a->builtin) builtin_leave(a);
   /* Gesture-bar path already snapped before cover; don't grab an empty/unmapped buffer. */
   if (!a->snap.tex) grab_snapshot(a);
@@ -1897,13 +2001,13 @@ static void install_sigchld_reaper(void) {
 /* ------------------------------------------------------------------------ */
 /* BUILT-IN APP: SETTINGS  (Wi-Fi prototype)                                */
 /*                                                                          */
-/* Drawn by the compositor itself (no X client window), so it gets the same */
-/* open/close/switcher animations as everything else. Wi-Fi is driven by    */
-/* `iw` (scanning) + `wpa_supplicant` (joining; saved networks live in its  */
-/* config file) + `ip` and a DHCP client, run as short-lived sh scripts    */
-/* whose output is collected without ever blocking the render loop.         */
-/* No NetworkManager needed. Without those tools (or with -m) a demo        */
-/* backend with fake networks is used. `-i wlan0` forces the interface.     */
+/* Drawn by the compositor itself (no X client window). Open, close and the */
+/* gesture-bar drag use the same icon flight as an X client (a snapshot     */
+/* pinched out of the icon); at rest the page is painted live.              */
+/* Wi-Fi prefers NetworkManager (`nmcli`), which is what nmtui uses: a      */
+/* password is stored in the connection profile and reused next time.       */
+/* Without nmcli it falls back to iw + wpa_supplicant + DHCP. Without       */
+/* either (or with -m) a demo backend is used. `-i wlan0` forces the iface. */
 /* ------------------------------------------------------------------------ */
 #define MAX_NETS   32
 #define MAX_SAVED  48
@@ -1935,6 +2039,7 @@ typedef struct { Rect r; int id, arg; } Hit;
 static int opt_mock_wifi = 0;
 static char opt_wifi_if[32] = "";
 static char wifi_missing[24] = "";   /* first missing tool, when falling back to demo data */
+static int wifi_nm = 0;              /* 1: NetworkManager (nmcli), 0: wpa_supplicant */
 
 static struct {
   int page, shown;           /* shown keeps the subpage on screen while Back animates home */
@@ -2502,6 +2607,84 @@ static const char *const WSH_BODY[] = {
   [WJ_CONNECT] = WSH_CONNECT, [WJ_DISCONNECT] = WSH_DISCONNECT, [WJ_FORGET] = WSH_FORGET,
 };
 
+/* NetworkManager. Same job tokens as the wpa scripts. A password passed to
+   `nmcli dev wifi connect` is stored in the connection profile (psk-flags 0)
+   and a later connect with no password reuses it. Never starts wpa_supplicant. */
+static const char NM_PRE[] =
+  "[ -e /tmp/summerboard-trace ] && set -x\n"
+  "export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH\"\n"
+  "IF=\"$SB_IF\"\n"
+  "if [ -z \"$IF\" ]; then\n"
+  "  IF=$(nmcli -t -f DEVICE,TYPE dev status | awk -F: '$2==\"wifi\" && $1 !~ /^p2p/ {print $1; exit}')\n"
+  "fi\n"
+  "LOG=/tmp/summerboard-wifi.log\n"
+  "[ -n \"$IF\" ] || { echo NODEV; exit 0; }\n";
+static const char NM_RADIO[] =
+  "nmcli -t -f WIFI radio\n";
+static const char NM_TOGGLE[] =
+  "if [ \"$SB_ARG\" = 1 ]; then nmcli radio wifi on; else nmcli radio wifi off; fi\n"
+  "echo done\n";
+static const char NM_SCAN[] =
+  "nmcli -t -f WIFI radio | grep -qx enabled || { echo DOWN; exit 0; }\n"
+  "nmcli -t -f IN-USE,SIGNAL,SECURITY,SSID dev wifi list ifname \"$IF\" --rescan yes 2>>\"$LOG\" |\n"
+  "awk -F: '{\n"
+  "  sig=$2; sec=$3; ssid=$0\n"
+  "  sub(/^[^:]*:[^:]*:[^:]*:/, \"\", ssid)\n"
+  "  if (ssid == \"\") next\n"
+  "  gsub(/\\t/, \" \", ssid)\n"
+  "  if (sec == \"\" || sec == \"--\") sec = \"--\"\n"
+  "  act = (index($1, \"*\") > 0) ? \"*\" : \" \"\n"
+  "  printf \"%s\\t%s\\t%s\\t%s\\n\", act, sig, sec, ssid\n"
+  "}'\n";
+static const char NM_SAVED[] =
+  "i=0\n"
+  "nmcli -t -f UUID,TYPE connection show | while IFS= read -r line; do\n"
+  "  uuid=${line%%:*}\n"
+  "  typ=${line#*:}\n"
+  "  [ \"$typ\" = 802-11-wireless ] || continue\n"
+  "  ssid=$(nmcli -g 802-11-wireless.ssid connection show \"$uuid\" 2>/dev/null) || continue\n"
+  "  [ -n \"$ssid\" ] || continue\n"
+  "  hex=$(printf '%s' \"$ssid\" | od -An -tx1 | tr -d '[:space:]')\n"
+  "  printf '%s\\t%s\\t\\n' \"$i\" \"$hex\"\n"
+  "  i=$((i + 1))\n"
+  "done\n";
+static const char NM_CONNECT[] =
+  "SSID=\"$SB_SSID\"\n"
+  "[ -n \"$SSID\" ] || { echo FAIL; exit 0; }\n"
+  "if [ -n \"$SB_PW\" ]; then\n"
+  "  err=$(nmcli -w 30 dev wifi connect \"$SSID\" password \"$SB_PW\" ifname \"$IF\" 2>&1)\n"
+  "else\n"
+  "  err=$(nmcli -w 30 dev wifi connect \"$SSID\" ifname \"$IF\" 2>&1)\n"
+  "fi\n"
+  "rc=$?\n"
+  "printf '%s\\n' \"$err\" >> \"$LOG\"\n"
+  "[ \"$rc\" -eq 0 ] && { echo OK; exit 0; }\n"
+  "case \"$err\" in\n"
+  "  *\"No network with\"*|*'not found'*|*\"No Wi-Fi\"*) echo NOTFOUND ;;\n"
+  "  *secret*|*Secret*|*password*|*psk*|*802-11-wireless-security*)\n"
+  "    if [ -n \"$SB_PW\" ]; then echo NID=1; echo AUTH; else echo NEEDPW; fi ;;\n"
+  "  *) if [ -n \"$SB_PW\" ]; then echo NID=1; echo AUTH; else echo FAIL; fi ;;\n"
+  "esac\n";
+static const char NM_DISCONNECT[] =
+  "nmcli dev disconnect \"$IF\" >/dev/null 2>>\"$LOG\"\n"
+  "echo OK\n";
+static const char NM_FORGET[] =
+  "SSID=\"$SB_SSID\"\n"
+  "nmcli -t -f UUID,TYPE connection show | while IFS= read -r line; do\n"
+  "  uuid=${line%%:*}\n"
+  "  typ=${line#*:}\n"
+  "  [ \"$typ\" = 802-11-wireless ] || continue\n"
+  "  ssid=$(nmcli -g 802-11-wireless.ssid connection show \"$uuid\" 2>/dev/null) || continue\n"
+  "  [ \"$ssid\" = \"$SSID\" ] || continue\n"
+  "  nmcli connection delete uuid \"$uuid\" >>\"$LOG\" 2>&1\n"
+  "done\n"
+  "if [ \"$SB_ARG\" = 1 ]; then nmcli dev disconnect \"$IF\" >/dev/null 2>>\"$LOG\"; fi\n"
+  "echo OK\n";
+static const char *const NM_BODY[] = {
+  [WJ_RADIO] = NM_RADIO, [WJ_TOGGLE] = NM_TOGGLE, [WJ_SCAN] = NM_SCAN, [WJ_SAVED] = NM_SAVED,
+  [WJ_CONNECT] = NM_CONNECT, [WJ_DISCONNECT] = NM_DISCONNECT, [WJ_FORGET] = NM_FORGET,
+};
+
 /* iw / wpa_cli print SSIDs with C-style escapes (\xHH, \\, \"). Decode them to raw bytes. */
 static void ssid_unescape(const char *in, char *out, size_t n) {
   size_t o = 0;
@@ -2564,16 +2747,22 @@ static int has_line(const char *s, const char *tok) {
   return 0;
 }
 
-static int wifi_tools_present(void) {
-  static const char *const need[] = { "iw", "wpa_supplicant", "ip" };
+static int tool_exists(const char *name) {
+  if (is_executable(name)) return 1;
   static const char *const dirs[] = { "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
+  for (size_t d = 0; d < sizeof dirs / sizeof dirs[0]; d++) {
+    char p[160]; snprintf(p, sizeof p, "%s/%s", dirs[d], name);
+    if (access(p, X_OK) == 0) return 1;
+  }
+  return 0;
+}
+
+static int wifi_tools_present(void) {
+  if (tool_exists("nmcli")) { wifi_nm = 1; wifi_missing[0] = 0; return 1; }
+  wifi_nm = 0;
+  static const char *const need[] = { "iw", "wpa_supplicant", "ip" };
   for (size_t i = 0; i < sizeof need / sizeof need[0]; i++) {
-    int ok = is_executable(need[i]);
-    for (size_t d = 0; d < sizeof dirs / sizeof dirs[0] && !ok; d++) {
-      char p[160]; snprintf(p, sizeof p, "%s/%s", dirs[d], need[i]);
-      ok = access(p, X_OK) == 0;
-    }
-    if (!ok) { snprintf(wifi_missing, sizeof wifi_missing, "%s", need[i]); return 0; }
+    if (!tool_exists(need[i])) { snprintf(wifi_missing, sizeof wifi_missing, "%s", need[i]); return 0; }
   }
   return 1;
 }
@@ -2586,10 +2775,17 @@ static void wj_begin(const WReq *q) {
     st.job.mock_end = st.job.t0 + delay[q->kind];
     return;
   }
-  const char *body = (q->kind > 0 && q->kind < (int)(sizeof WSH_BODY / sizeof WSH_BODY[0])) ? WSH_BODY[q->kind] : NULL;
+  const char *const *bodies = wifi_nm ? NM_BODY : WSH_BODY;
+  size_t nbody = wifi_nm ? sizeof NM_BODY / sizeof NM_BODY[0] : sizeof WSH_BODY / sizeof WSH_BODY[0];
+  const char *pre = wifi_nm ? NM_PRE : WSH_PRE;
+  const char *body = (q->kind > 0 && q->kind < (int)nbody) ? bodies[q->kind] : NULL;
   if (!body) return;
   static char script[8192];
-  snprintf(script, sizeof script, "%s%s", WSH_PRE, body);
+  int nw = snprintf(script, sizeof script, "%s%s", pre, body);
+  if (nw < 0 || nw >= (int)sizeof script) {
+    fprintf(stderr, "summerboard: wifi script truncated (%d)\n", nw);
+    return;
+  }
 
   int pfd[2];
   if (pipe(pfd) != 0) return;
@@ -2606,6 +2802,7 @@ static void wj_begin(const WReq *q) {
     char hex[160], nb[16];
     ssid_hex(q->ssid, hex, sizeof hex);
     setenv("SB_SSID_HEX", hex, 1);
+    setenv("SB_SSID", q->ssid, 1);
     snprintf(nb, sizeof nb, "%d", q->nid); setenv("SB_NID", nb, 1);
     snprintf(nb, sizeof nb, "%d", q->arg); setenv("SB_ARG", nb, 1);
     setenv("SB_SEC", q->sec[0] ? q->sec : "--", 1);
@@ -4285,6 +4482,11 @@ static int on_pointer_down(double x, double y) {
         full.h = eff_h - (int)lround(S(12));
         rs_snap(&win_spring, full);
       }
+    } else if (active_app && active_app->builtin) {
+      settings_snapshot(active_app);
+      Rect full = full_rect();
+      full.h = eff_h - (int)lround(S(12));
+      rs_snap(&win_spring, full);
     }
     gesture->start_x = x; gesture->start_y = y; gesture->px = x; gesture->py = y;
     gesture->last_move_t = now_ms(); gesture->last_move_x = x; gesture->last_move_y = y;
@@ -4391,7 +4593,7 @@ static void on_pointer_move(double x, double y) {
   }
 
   if (active_app) {
-    if (!active_app->builtin) flight_app = active_app;   /* following the finger toward the icon */
+    flight_app = active_app;   /* following the finger toward the icon */
     Rect full = full_rect(), icon = icon_rect(active_app);
     double w = full.w + (icon.w - full.w) * t;
     double h = full.h + (icon.h - full.h) * t;
@@ -4787,14 +4989,18 @@ static void render_frame(void) {
 
   if (shown && (fl_busy || shown->builtin || shown->covered || gesture || switcher.open || win_spring.w.x < W - 2)) {
     if (rect.w > 1 && rect.h > 1) {
-      if (shown->builtin) {
-        builtin_paint(t, shown, rect);      /* no X window: the compositor draws it live, even at rest */
-      } else if (shown == flight_app) {     /* icon <-> window: pinched, squared, corners rise and land */
+      /* Built-in apps are live only once the card has landed. While it is moving
+         they use the same pinched icon flight (or switcher card) as an X client. */
+      int in_flight = rs_busy(&win_spring) || fl_busy
+        || (gesture && strcmp(gesture->mode, "drag") == 0);
+      if (shown->builtin && !in_flight) {
+        builtin_paint(t, shown, rect);
+      } else if (shown == flight_app) {
         Rect rest = full_rect();
         rest.h = eff_h - (int)lround(S(12));
         draw_flight(t, shown->snap.tex ? &shown->snap : &gl_white, rect, icon_rect(shown), rest);
       } else {
-        draw_card(t, shown, rect, 1.0);     /* card <-> window: rounded corners + shadow */
+        draw_card(t, shown, rect, 1.0);
       }
     }
   }
@@ -5009,17 +5215,21 @@ static Window app_best_content_win(App *a) {
   if (!a || a->nwin <= 0) return None;
   Window best = None;
   unsigned best_area = 0;
+  Window popup = None;
   for (int i = 0; i < a->nwin; i++) {
     Window w = a->wins[i];
-    if (window_opacity_is_zero(w) || window_is_input_only(w)) continue;
+    if (window_opacity_is_zero(w) || window_is_input_only(w) || window_is_splash(w)) continue;
     Window rr; int x, y; unsigned ww, hh, b, d;
     if (!XGetGeometry(dpy, w, &rr, &x, &y, &ww, &hh, &b, &d)) continue;
     if (ww < 64 || hh < 64) continue;
     XWindowAttributes wa;
     if (XGetWindowAttributes(dpy, w, &wa) && wa.map_state == IsUnmapped) continue;
+    /* A dialog or combo is the click target. The last one is the one we raised. */
+    if (window_keeps_own_size(w)) { popup = w; continue; }
     unsigned area = ww * hh;
     if (area >= best_area) { best_area = area; best = w; }
   }
+  if (popup != None) return popup;
   if (best != None) return best;
   for (int i = a->nwin - 1; i >= 0; i--)
     if (!window_opacity_is_zero(a->wins[i]) && !window_is_input_only(a->wins[i]))
@@ -5113,9 +5323,12 @@ static void window_apply_fullscreen(Window w, int on) {
     XDeleteProperty(dpy, w, atom_net_wm_state);
 
   /* Geometry always leaves the home-gesture inset — FULLSCREEN hides client chrome,
-     it must not bury the gesture bar / lane. */
-  if (!window_is_trivial(w))
-    XMoveResizeWindow(dpy, w, 0, 0, W, (unsigned)app_normal_h());
+     it must not bury the gesture bar / lane. Dialogs keep the size they asked for. */
+  {
+    int dx, dy, dw, dh;
+    if (window_target_geom(NULL, w, &dx, &dy, &dw, &dh))
+      XMoveResizeWindow(dpy, w, dx, dy, (unsigned)dw, (unsigned)dh);
+  }
   gesture_lane_raise();
 }
 
@@ -5158,10 +5371,20 @@ static void ewmh_init(void) {
   atom_net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
   atom_net_active_window = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
   atom_net_wm_window_opacity = XInternAtom(dpy, "_NET_WM_WINDOW_OPACITY", False);
+  Atom atom_check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+  /* SDL treats a missing _NET_SUPPORTING_WM_CHECK as "no WM" and then
+     XSetInputFocus on its window. That BadMatch aborts Tux Paint (default
+     X error handler) when the window is not viewable yet. */
+  Window check = XCreateSimpleWindow(dpy, root, -1, -1, 1, 1, 0, 0, 0);
+  XChangeProperty(dpy, check, atom_check, XA_WINDOW, 32, PropModeReplace,
+                  (unsigned char *)&check, 1);
+  XChangeProperty(dpy, root, atom_check, XA_WINDOW, 32, PropModeReplace,
+                  (unsigned char *)&check, 1);
   Atom supported[] = {
     atom_net_wm_state,
     atom_net_wm_state_fullscreen,
     atom_net_active_window,
+    atom_check,
   };
   XChangeProperty(dpy, root, atom_net_supported, XA_ATOM, 32, PropModeReplace,
                   (unsigned char *)supported, (int)(sizeof supported / sizeof supported[0]));
@@ -5235,18 +5458,25 @@ static void manage_client_window(App *a, Window w) {
 
   int target_h = app_normal_h();
   XSetWindowBorderWidth(dpy, w, 0);
-  if (!window_is_trivial(w))
-    XMoveResizeWindow(dpy, w, 0, 0, W, (unsigned)target_h);
+  {
+    int dx, dy, dw, dh;
+    /* Size first, then map. SDL blocks forever in XIfEvent until MapNotify,
+       and a 1x1 DirectColor placeholder (Tux Paint) never becomes visible. */
+    if (window_dialog_geom(w, &dx, &dy, &dw, &dh) || window_target_geom(a, w, &dx, &dy, &dw, &dh))
+      XMoveResizeWindow(dpy, w, dx, dy, (unsigned)dw, (unsigned)dh);
+  }
   for (int i = 0; i < a->nwin; i++)
     if (a->wins[i] == w) a->sent_win[i] = None;
 
   int show = (active_app == a && a->state == ST_FG && !a->covered && !rs_busy(&win_spring) && !gesture && !switcher.open);
   if (!show) {
-    XUnmapWindow(dpy, w);
+    XMapWindow(dpy, w);
+    XLowerWindow(dpy, w);
     shell_raise_home();
     return;
   }
   a->covered = 0;
+  if (window_owns_colormap(w)) window_install_colormap(w);
   XMapWindow(dpy, w);
   XRaiseWindow(dpy, w);
   gesture_lane_raise();
@@ -5256,6 +5486,357 @@ static void manage_client_window(App *a, Window w) {
   Rect full = full_rect();
   full.h = target_h;
   rs_snap(&win_spring, full);
+}
+
+/* GoldSrc installs a DirectColor colormap as its gamma ramp. Leaving that
+   colormap installed after the window is gone maps the TrueColor shell to black. */
+static int window_owns_colormap(Window w) {
+  XWindowAttributes wa;
+  if (!XGetWindowAttributes(dpy, w, &wa)) return 0;
+  return wa.colormap != None && wa.colormap != DefaultColormap(dpy, scr);
+}
+
+/* SDL's own window (class "Hl_linux"). The picture is a second DirectColor
+   window; this one is where button events are delivered. */
+static int window_is_sdl_host(Window w) {
+  XClassHint ch;
+  if (!XGetClassHint(dpy, w, &ch)) return 0;
+  int yes = ch.res_class && strcmp(ch.res_class, "Hl_linux") == 0;
+  if (ch.res_name) XFree(ch.res_name);
+  if (ch.res_class) XFree(ch.res_class);
+  return yes;
+}
+
+/* Parent of a window the client reparented away from the root (not the shell).
+   None means "treat it as a normal top-level". */
+static Window window_frame_parent(Window w) {
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  if (!w || !XQueryTree(dpy, w, &rr, &parent, &kids, &nk)) return None;
+  if (kids) XFree(kids);
+  if (parent == None || parent == root || parent == shell || parent == kbd_win || parent == gesture_lane)
+    return None;
+  return parent;
+}
+
+/* GoldSrc's reparented drawable and its Hl_linux host. Resizing those clips
+   the picture or fights the game. A top-level DirectColor window (Tux Paint)
+   is not one of these and must be placed like any other app. */
+static int window_skip_place(Window w) {
+  return window_frame_parent(w) != None || window_is_sdl_host(w);
+}
+
+/* Dialogs, splash screens, menus and combo popups name their own size.
+   Stretching them to the content box (Krita's 478x577 combo became
+   1366x756) puts an invisible click shield over the window the user sees. */
+static int window_type_has(Window w, const char *name) {
+  if (w == None || !name) return 0;
+  Atom prop = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+  Atom want = XInternAtom(dpy, name, False);
+  Atom type = None; int fmt = 0; unsigned long n = 0, bytes = 0; unsigned char *data = NULL;
+  int ok = XGetWindowProperty(dpy, w, prop, 0, 32, False, XA_ATOM,
+                              &type, &fmt, &n, &bytes, &data);
+  int yes = 0;
+  if (ok == Success && data && type == XA_ATOM && fmt == 32) {
+    Atom *atoms = (Atom *)data;
+    for (unsigned long i = 0; i < n; i++)
+      if (atoms[i] == want) { yes = 1; break; }
+  }
+  if (data) XFree(data);
+  return yes;
+}
+
+static int window_is_splash(Window w) {
+  return window_type_has(w, "_NET_WM_WINDOW_TYPE_SPLASH");
+}
+
+static int window_keeps_own_size(Window w) {
+  static const char *aux[] = {
+    "_NET_WM_WINDOW_TYPE_DIALOG",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_MENU",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+    "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP",
+    "_NET_WM_WINDOW_TYPE_UTILITY",
+    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    "_NET_WM_WINDOW_TYPE_COMBO",
+    "_NET_WM_WINDOW_TYPE_DND",
+    NULL
+  };
+  for (int i = 0; aux[i]; i++)
+    if (window_type_has(w, aux[i])) return 1;
+  Window t = None;
+  return XGetTransientForHint(dpy, w, &t) && t != None;
+}
+
+static void clamp_to_content(int *x, int *y, int *w, int *h) {
+  int band = app_normal_h();
+  if (band < 1) band = 1;
+  if (*w > W) *w = W;
+  if (*h > band) *h = band;
+  if (*w < 1) *w = 1;
+  if (*h < 1) *h = 1;
+  if (*x < 0) *x = 0;
+  if (*y < 0) *y = 0;
+  if (*x + *w > W) *x = W - *w;
+  if (*y + *h > band) *y = band - *h;
+  if (*x < 0) *x = 0;
+  if (*y < 0) *y = 0;
+}
+
+static int window_own_geom(Window w, int *ox, int *oy, int *ow, int *oh) {
+  XSizeHints h;
+  long sup = 0;
+  memset(&h, 0, sizeof h);
+  int have = XGetWMNormalHints(dpy, w, &h, &sup);
+  int band = app_normal_h();
+  if (band < 1) band = 1;
+  if (have && (h.flags & (USSize | PSize)) && h.width >= 16 && h.height >= 16
+      && h.width <= W && h.height <= band) {
+    *ow = h.width;
+    *oh = h.height;
+  } else if (have && (h.flags & PMaxSize) && h.max_width >= 16 && h.max_height >= 16
+             && h.max_width < W - 8 && h.max_height < band - 8) {
+    *ow = h.max_width;
+    *oh = h.max_height;
+  } else {
+    Window rr; int x, y; unsigned ww, hh, b, d;
+    if (!XGetGeometry(dpy, w, &rr, &x, &y, &ww, &hh, &b, &d)) return 0;
+    if (ww < 16 || hh < 16 || (int)ww >= W - 2) return 0;
+    *ox = x; *oy = y; *ow = (int)ww; *oh = (int)hh;
+    clamp_to_content(ox, oy, ow, oh);
+    return 1;
+  }
+  if (have && (h.flags & (USPosition | PPosition))) {
+    *ox = h.x;
+    *oy = h.y;
+  } else {
+    *ox = (W - *ow) / 2;
+    *oy = (band - *oh) / 2;
+  }
+  clamp_to_content(ox, oy, ow, oh);
+  return 1;
+}
+
+/* The startup splash sits fullscreen once we have stretched it and steals
+   the pointer from the real window. Drop it when another content window exists. */
+static void app_bury_splash(App *a) {
+  if (!a) return;
+  int real = 0;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    if (window_is_splash(w) || window_is_input_only(w) || window_opacity_is_zero(w)) continue;
+    if (!window_is_trivial(w)) real = 1;
+  }
+  if (!real) return;
+  for (int i = 0; i < a->nwin; i++)
+    if (window_is_splash(a->wins[i])) XUnmapWindow(dpy, a->wins[i]);
+}
+
+/* Put dialogs and combos back at the size the client named, and above the
+   main window, so a click on a button hits that button. */
+static void app_place_popups(App *a) {
+  if (!a || a->builtin || !client_may_show(a, None)) return;
+  Window top = None;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    if (window_is_splash(w) || !window_keeps_own_size(w)) continue;
+    int dx, dy, dw, dh;
+    if (!window_own_geom(w, &dx, &dy, &dw, &dh)) continue;
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa) || wa.map_state == IsUnmapped) continue;
+    if (wa.x != dx || wa.y != dy || wa.width != dw || wa.height != dh)
+      XMoveResizeWindow(dpy, w, dx, dy, (unsigned)dw, (unsigned)dh);
+    XRaiseWindow(dpy, w);
+    top = w;
+  }
+  if (top == None) return;
+  gesture_lane_raise();
+  Window cur = None; int rev = RevertToNone;
+  XGetInputFocus(dpy, &cur, &rev);
+  int on_popup = 0;
+  for (int i = 0; i < a->nwin; i++)
+    if (a->wins[i] == cur && window_keeps_own_size(cur) && !window_is_splash(cur))
+      on_popup = 1;
+  if (!on_popup) {
+    XSetInputFocus(dpy, top, RevertToPointerRoot, CurrentTime);
+    if (atom_net_active_window)
+      XChangeProperty(dpy, root, atom_net_active_window, XA_WINDOW, 32,
+                      PropModeReplace, (unsigned char *)&top, 1);
+  }
+}
+
+static void window_install_colormap(Window w) {
+  XWindowAttributes wa;
+  if (!XGetWindowAttributes(dpy, w, &wa)) return;
+  if (wa.colormap != None && wa.colormap != DefaultColormap(dpy, scr))
+    XInstallColormap(dpy, wa.colormap);
+}
+
+/* 1 = apply *ox..*oh before map. Normal top-levels fill the content area
+   above the gesture bar. A real dialog keeps the size it named. A tiny
+   helper next to an already-placed window is left alone (return 0). */
+static int window_target_geom(App *a, Window w, int *ox, int *oy, int *ow, int *oh) {
+  if (w == None || window_skip_place(w)) return 0;
+  if (window_is_input_only(w) || window_opacity_is_zero(w)) return 0;
+  /* Popups name a real rectangle. Never promote them to the content box. */
+  if (window_keeps_own_size(w))
+    return window_own_geom(w, ox, oy, ow, oh);
+  if (window_dialog_geom(w, ox, oy, ow, oh)) return 1;
+  if (a && window_is_trivial(w)) {
+    for (int i = 0; i < a->nwin; i++) {
+      Window o = a->wins[i];
+      if (o == w || window_is_input_only(o) || window_opacity_is_zero(o)) continue;
+      if (!window_is_trivial(o) && !window_skip_place(o)) return 0;
+    }
+  }
+  *ox = 0;
+  *oy = 0;
+  *ow = W;
+  *oh = app_normal_h();
+  if (*ow < 1) *ow = 1;
+  if (*oh < 1) *oh = 1;
+  return 1;
+}
+
+/* FG content that is still unmapped or a 1x1 placeholder: place it and map it.
+   SDL will not leave XIfEvent(MapNotify) until this happens, and a placeholder
+   that stays 1x1 looks like the app never opened. */
+static void app_ensure_placed(App *a) {
+  if (!a || a->builtin || !client_may_show(a, None)) return;
+  int placed = 0;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    if (window_is_input_only(w) || window_opacity_is_zero(w) || window_skip_place(w)) continue;
+    /* Dialogs, menus and the splash map themselves. Forcing them back
+       after the client unmaps them leaves a stack of click shields. */
+    if (window_keeps_own_size(w)) continue;
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa)) continue;
+    int dx, dy, dw, dh;
+    int have = window_target_geom(a, w, &dx, &dy, &dw, &dh);
+    int tiny = wa.width < 64 || wa.height < 64;
+    if (wa.map_state == IsViewable && !tiny) continue;
+    if (!have) continue;
+    XMoveResizeWindow(dpy, w, dx, dy, (unsigned)dw, (unsigned)dh);
+    if (window_owns_colormap(w)) window_install_colormap(w);
+    if (wa.map_state != IsViewable) XMapWindow(dpy, w);
+    XRaiseWindow(dpy, w);
+    placed = 1;
+  }
+  if (placed) gesture_lane_raise();
+}
+
+/* GoldSrc reparents its drawable into an override-redirect DirectColor frame the
+   size of the video mode, then XGrabPointer on that frame. The warning is a
+   separate window. Stacking it above the frame does nothing: the grab delivers
+   every touch to the game, including the gesture lane, so the dialog cannot be
+   clicked and home cannot be reached. Unmapping the grab window releases it.
+   The drawable stays in the frame; moving the frame makes GoldSrc park the
+   picture at a negative offset and the window looks empty. */
+static int app_show_nested(App *a) {
+  if (!a || a->builtin) return 0;
+  int show = client_may_show(a, None);
+  int hold = client_cover_hold(a, None);
+  if (!show && !hold) return 0;
+
+  Window dialogs[MAX_WINS];
+  int nd = 0;
+  for (int i = 0; i < a->nwin && nd < MAX_WINS; i++) {
+    Window w = a->wins[i];
+    int dx, dy, dw, dh;
+    XWindowAttributes dwa;
+    if (!window_dialog_geom(w, &dx, &dy, &dw, &dh)) continue;
+    if (!XGetWindowAttributes(dpy, w, &dwa) || dwa.map_state == IsUnmapped) continue;
+    XMoveResizeWindow(dpy, w, dx, dy, (unsigned)dw, (unsigned)dh);
+    dialogs[nd++] = w;
+  }
+
+  int n = 0;
+  Window frames[MAX_WINS];
+  int nf = 0;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    Window p = window_frame_parent(w);
+    if (p == None) continue;
+    if (window_is_input_only(w) || window_opacity_is_zero(w) || window_is_trivial(w)) continue;
+    int dx, dy, dw, dh;
+    if (window_dialog_geom(w, &dx, &dy, &dw, &dh)) continue;
+    XWindowAttributes pwa;
+    if (!XGetWindowAttributes(dpy, p, &pwa)) continue;
+    if (!pwa.override_redirect) continue;
+    if (pwa.width < 64 || pwa.height < 64) continue;
+    if (nd > 0) {
+      /* Dialog is modal. The frame's pointer grab must go. */
+      if (pwa.map_state != IsUnmapped) XUnmapWindow(dpy, p);
+    } else if (show) {
+      Window rr; int x, y; unsigned ww, hh, b, d;
+      if (XGetGeometry(dpy, w, &rr, &x, &y, &ww, &hh, &b, &d)
+          && (x < 0 || y < 0 || x + (int)ww > pwa.width || y + (int)hh > pwa.height))
+        XMoveWindow(dpy, w, 0, 0);
+      if (pwa.map_state != IsViewable) XMapWindow(dpy, p);
+      int seen = 0;
+      for (int h = 0; h < nf; h++) if (frames[h] == p) seen = 1;
+      if (!seen && nf < MAX_WINS) frames[nf++] = p;
+    } else {
+      XLowerWindow(dpy, p);
+    }
+    n++;
+  }
+  if (nd == 0)
+    for (int h = 0; h < nf; h++) XRaiseWindow(dpy, frames[h]);
+  Window focus = None;
+  if (show) {
+    for (int i = 0; i < nd; i++) { XRaiseWindow(dpy, dialogs[i]); focus = dialogs[i]; }
+  }
+  if (show && focus != None)
+    XSetInputFocus(dpy, focus, RevertToPointerRoot, CurrentTime);
+  else if (show && nf)
+    XSetInputFocus(dpy, frames[nf - 1], RevertToPointerRoot, CurrentTime);
+  if (show && (n || nd)) gesture_lane_raise();
+  return n + nd;
+}
+
+/* Put the default colormap back when no visible window still needs its own.
+   A leftover DirectColor ramp scans the shell out as black. */
+static void colormap_guard(void) {
+  int n = 0;
+  Colormap *cms = XListInstalledColormaps(dpy, root, &n);
+  Colormap def = DefaultColormap(dpy, scr);
+  int foreign = 0;
+  for (int i = 0; i < n; i++) if (cms[i] != def) foreign = 1;
+  if (cms) XFree(cms);
+  if (!foreign) return;
+  int keep = 0;
+  if (active_app && client_may_show(active_app, None)) {
+    for (int i = 0; i < active_app->nwin && !keep; i++) {
+      Window w = active_app->wins[i];
+      XWindowAttributes wa;
+      if (!XGetWindowAttributes(dpy, w, &wa) || wa.map_state != IsViewable) continue;
+      if (wa.colormap != None && wa.colormap != def) keep = 1;
+      Window p = window_frame_parent(w);
+      if (p != None && XGetWindowAttributes(dpy, p, &wa) && wa.map_state == IsViewable
+          && wa.colormap != None && wa.colormap != def) keep = 1;
+    }
+  }
+  if (!keep) XInstallColormap(dpy, def);
+}
+
+/* True if this root window is the frame around a drawable we want on screen. */
+static int root_hosts_visible_app(Window w) {
+  Window rr, parent, *kids = NULL; unsigned nk = 0;
+  if (!XQueryTree(dpy, w, &rr, &parent, &kids, &nk) || !kids) return 0;
+  int yes = 0;
+  for (unsigned i = 0; i < nk && !yes; i++) {
+    App *a = find_app_by_win(kids[i]);
+    if (!a) a = find_app_by_pid(window_pid(kids[i]));
+    if (!a) a = find_app_by_class(kids[i]);
+    if (!a) continue;
+    if (window_is_input_only(kids[i]) || window_opacity_is_zero(kids[i])) continue;
+    if (client_may_show(a, kids[i]) || client_cover_hold(a, kids[i])) yes = 1;
+  }
+  XFree(kids);
+  return yes;
 }
 
 static void on_map_request(XMapRequestEvent *e) {
@@ -5316,6 +5897,12 @@ static void on_map_request(XMapRequestEvent *e) {
     shell_raise_home();
     return;
   }
+  /* Replacement window after SDL destroyed the placeholder. Put it back in front. */
+  if (a->state == ST_CLOSED && app_alive(a)
+      && !window_is_input_only(e->window) && !window_opacity_is_zero(e->window)) {
+    a->state = ST_FG;
+    if (!active_app || active_app == a) active_app = a;
+  }
 
   if (rs_busy(&win_spring) || gesture || (active_app == a && a->covered)) {
     app_add_win(a, e->window);
@@ -5329,8 +5916,12 @@ static void on_map_request(XMapRequestEvent *e) {
       return;
     }
     XSetWindowBorderWidth(dpy, e->window, 0);
-    XMoveResizeWindow(dpy, e->window, 0, 0, W, (unsigned)app_normal_h());
-    /* Map under the shell so Chromium keeps a live buffer; shell stays on top. */
+    {
+      int dx, dy, dw, dh;
+      if (window_target_geom(a, e->window, &dx, &dy, &dw, &dh))
+        XMoveResizeWindow(dpy, e->window, dx, dy, (unsigned)dw, (unsigned)dh);
+    }
+    /* Map under the shell so Chromium keeps a live buffer and SDL gets MapNotify. */
     XMapWindow(dpy, e->window);
     XLowerWindow(dpy, e->window);
     shell_raise_home();
@@ -5369,11 +5960,10 @@ static void on_map_notify(XMapEvent *e) {
     }
     /* OR / EWMH fullscreen: keep mapped but clamp off the gesture inset, then
        put the lane back on top so home-swipe still works. */
-    if (!window_is_trivial(e->window)) {
-      Window rr; int x, y; unsigned ww, hh, b, d;
-      if (XGetGeometry(dpy, e->window, &rr, &x, &y, &ww, &hh, &b, &d)
-          && ((int)hh > app_normal_h() || window_looks_fullscreen(e->window)))
-        XMoveResizeWindow(dpy, e->window, 0, 0, W, (unsigned)app_normal_h());
+    {
+      int dx, dy, dw, dh;
+      if (window_target_geom(a, e->window, &dx, &dy, &dw, &dh))
+        XMoveResizeWindow(dpy, e->window, dx, dy, (unsigned)dw, (unsigned)dh);
       if (window_looks_fullscreen(e->window) || window_has_fullscreen_state(e->window)) {
         XRaiseWindow(dpy, e->window);
         Window best = app_best_content_win(a);
@@ -5386,8 +5976,16 @@ static void on_map_notify(XMapEvent *e) {
   }
   /* During a cover/swipe, keep the FG app's windows mapped under the shell. */
   if (a && active_app == a && a->state == ST_FG && a->covered) {
+    int dx, dy, dw, dh;
+    if (!window_is_input_only(e->window) && !window_opacity_is_zero(e->window)
+        && window_target_geom(a, e->window, &dx, &dy, &dw, &dh))
+      XMoveResizeWindow(dpy, e->window, dx, dy, (unsigned)dw, (unsigned)dh);
     XLowerWindow(dpy, e->window);
     shell_raise_home();
+    return;
+  }
+  if (root_hosts_visible_app(e->window)) {
+    if (active_app) app_show_nested(active_app);
     return;
   }
   XUnmapWindow(dpy, e->window);
@@ -5414,6 +6012,160 @@ static int client_cover_hold(App *a, Window w) {
   return 1;
 }
 
+/* The picture window is the hit target, so it is the window that receives
+   the real ButtonPress. GoldSrc still reads the buttons from the SDL window
+   underneath (mouse position is polled on the picture, so that kept working).
+   Copy the press and the release across. */
+static Window game_ptr_engine = None, game_ptr_host = None;
+static int game_ptr_fwd = 0;
+
+static void game_forward_button(XButtonEvent *e) {
+  if (game_ptr_host == None || e->window != game_ptr_engine) return;
+  Window rr; int hx, hy; unsigned hw, hh, hb, hd;
+  if (!XGetGeometry(dpy, game_ptr_host, &rr, &hx, &hy, &hw, &hh, &hb, &hd)) return;
+  int lx = e->x_root - hx, ly = e->y_root - hy;
+  XMotionEvent me;
+  memset(&me, 0, sizeof me);
+  me.type = MotionNotify;
+  me.display = dpy;
+  me.window = game_ptr_host;
+  me.root = root;
+  me.time = e->time;
+  me.x = lx;
+  me.y = ly;
+  me.x_root = e->x_root;
+  me.y_root = e->y_root;
+  me.state = e->state;
+  me.is_hint = NotifyNormal;
+  me.same_screen = True;
+  XSendEvent(dpy, game_ptr_host, False, PointerMotionMask, (XEvent *)&me);
+  XButtonEvent be;
+  memset(&be, 0, sizeof be);
+  be.type = e->type;
+  be.display = dpy;
+  be.window = game_ptr_host;
+  be.root = root;
+  be.time = e->time;
+  be.x = lx;
+  be.y = ly;
+  be.x_root = e->x_root;
+  be.y_root = e->y_root;
+  be.state = e->state;
+  be.button = e->button;
+  be.same_screen = True;
+  long mask = e->type == ButtonPress ? ButtonPressMask : ButtonReleaseMask;
+  XSendEvent(dpy, game_ptr_host, False, mask, (XEvent *)&be);
+}
+
+/* Windowed GoldSrc draws into a DirectColor window and that same window is
+   where it reads the pointer and the keyboard. The SDL window underneath does
+   not. Letting clicks fall through it made the mouse and the keys disappear.
+   Keep the picture on top and give it the input focus. The terminal stays behind. */
+static void game_route_clicks(App *a) {
+  if (!a || a->builtin || !client_may_show(a, None)) return;
+  for (int i = 0; i < a->nwin; i++) {
+    int dx, dy, dw, dh;
+    XWindowAttributes wa;
+    if (!window_dialog_geom(a->wins[i], &dx, &dy, &dw, &dh)) continue;
+    if (XGetWindowAttributes(dpy, a->wins[i], &wa) && wa.map_state != IsUnmapped) return;
+  }
+  Window engine = None, host = None;
+  unsigned best = 0;
+  for (int i = 0; i < a->nwin; i++) {
+    Window w = a->wins[i];
+    if (window_is_sdl_host(w)) { host = w; continue; }
+    if (!window_owns_colormap(w) || window_is_trivial(w)) continue;
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa) || wa.map_state != IsViewable) continue;
+    unsigned area = (unsigned)wa.width * (unsigned)wa.height;
+    if (area >= best) { best = area; engine = w; }
+  }
+  if (engine == None || host == None) {
+    game_ptr_engine = None;
+    game_ptr_host = None;
+    return;
+  }
+  game_ptr_engine = engine;
+  game_ptr_host = host;
+  /* Our mask is separate from the game's. Selecting here gives us a copy of
+     the click so we can hand it to SDL; the picture window still gets the real one. */
+  static Window armed = None;
+  if (armed != engine) {
+    XSelectInput(dpy, engine, StructureNotifyMask | PropertyChangeMask | ButtonPressMask | ButtonReleaseMask);
+    armed = engine;
+  }
+
+  Window rr; int x, y; unsigned ww, hh, b, d;
+  if (!XGetGeometry(dpy, engine, &rr, &x, &y, &ww, &hh, &b, &d)) return;
+  XWindowAttributes hwa;
+  if (!XGetWindowAttributes(dpy, host, &hwa)) return;
+  if (hwa.map_state != IsViewable || hwa.x != x || hwa.y != y || hwa.width != (int)ww || hwa.height != (int)hh) {
+    if (hwa.x != x || hwa.y != y || hwa.width != (int)ww || hwa.height != (int)hh)
+      XMoveResizeWindow(dpy, host, x, y, ww, hh);
+    if (hwa.map_state != IsViewable) XMapWindow(dpy, host);
+  }
+
+  static int shape_ok = -1, shape_ev, shape_err;
+  static Window shape_fixed = None;
+  if (shape_ok < 0) shape_ok = XShapeQueryExtension(dpy, &shape_ev, &shape_err);
+  if (shape_ok && shape_fixed != engine) {
+    int nrect = 0, ord = 0;
+    XRectangle *rects = XShapeGetRectangles(dpy, engine, ShapeInput, &nrect, &ord);
+    if (rects) XFree(rects);
+    if (nrect == 0)
+      XShapeCombineMask(dpy, engine, ShapeInput, 0, 0, None, ShapeSet);
+    shape_fixed = engine;
+  }
+
+  /* Restack only when the terminal (or anything else) has climbed above the
+     SDL window. Doing it on every touch flashes the whole panel. */
+  Window rroot, rparent, *kids = NULL; unsigned nk = 0;
+  int host_i = -1, engine_i = -1, above = 0;
+  if (XQueryTree(dpy, root, &rroot, &rparent, &kids, &nk) && kids) {
+    for (unsigned i = 0; i < nk; i++) {
+      if (kids[i] == host) host_i = (int)i;
+      if (kids[i] == engine) engine_i = (int)i;
+    }
+    for (int i = 0; i < a->nwin; i++) {
+      Window w = a->wins[i];
+      int dx, dy, dw, dh;
+      if (w == engine || w == host) continue;
+      if (window_dialog_geom(w, &dx, &dy, &dw, &dh)) continue;
+      for (unsigned k = 0; k < nk; k++)
+        if (kids[k] == w && host_i >= 0 && (int)k > host_i) above = 1;
+    }
+    int lane_top = nk > 0 && kids[nk - 1] == gesture_lane;
+    int pair_ok = host_i >= 0 && engine_i == host_i + 1 && !above;
+    XFree(kids);
+    if (!pair_ok) {
+      if (above) {
+        for (int i = 0; i < a->nwin; i++) {
+          Window w = a->wins[i];
+          int dx, dy, dw, dh;
+          if (w == engine || w == host) continue;
+          if (window_dialog_geom(w, &dx, &dy, &dw, &dh)) continue;
+          XLowerWindow(dpy, w);
+        }
+      }
+      XRaiseWindow(dpy, host);
+      XRaiseWindow(dpy, engine);
+      lane_top = 0;
+    }
+    if (!lane_top) gesture_lane_raise();
+  }
+
+  /* Keys are selected on the picture window, not the SDL window under it.
+     Forcing focus onto SDL made the game treat itself as inactive: no keys,
+     and the frame rate collapsed. Only correct focus when it has wandered. */
+  Window cur = None; int rev = 0;
+  XGetInputFocus(dpy, &cur, &rev);
+  static double focus_at = 0;
+  if (cur != engine && cur != gesture_lane && now_ms() >= focus_at) {
+    XSetInputFocus(dpy, engine, RevertToPointerRoot, CurrentTime);
+    focus_at = now_ms() + 400.0;
+  }
+}
+
 /* Unmap every root child that should not cover home / the FG app. Brave remaps
    helpers for seconds after minimize; call before AND after draining X events. */
 static void home_enforce_stacking(void) {
@@ -5424,6 +6176,9 @@ static void home_enforce_stacking(void) {
     for (unsigned i = 0; i < nk; i++) {
       Window w = kids[i];
       if (w == shell || w == kbd_win || w == gesture_lane) continue;
+      /* Mode-sized override-redirect frame around a live game window. Unmapping
+         it makes the child IsUnviewable — a blank screen with the game running. */
+      if (root_hosts_visible_app(w)) continue;
       App *a = find_app_by_win(w);
       if (!a) a = find_app_by_pid(window_pid(w));
       if (!a) a = find_app_by_class(w);
@@ -5452,8 +6207,22 @@ static void home_enforce_stacking(void) {
   }
   if (active_app && !active_app->builtin && !active_app->covered)
     app_hide_invisible_overlays(active_app);
-  if (!active_app || hid || (active_app && active_app->covered)) shell_raise_home();
-  else if (active_app) gesture_lane_raise();
+  /* Raising the shell over a visible game paints the wallpaper for a frame.
+     A touch was doing that on every event. */
+  if (active_app && client_may_show(active_app, None))
+    gesture_lane_raise();
+  else if (!active_app || hid || (active_app && active_app->covered))
+    shell_raise_home();
+  else if (active_app)
+    gesture_lane_raise();
+  if (active_app && (client_may_show(active_app, None) || client_cover_hold(active_app, None)))
+    app_show_nested(active_app);
+  if (active_app) game_route_clicks(active_app);
+  if (active_app) app_ensure_placed(active_app);
+  if (active_app && client_may_show(active_app, None)) {
+    app_bury_splash(active_app);
+    app_place_popups(active_app);
+  }
 }
 
 static void on_configure_request(XConfigureRequestEvent *e) {
@@ -5508,14 +6277,43 @@ static void on_configure_request(XConfigureRequestEvent *e) {
     /* Chromium/Brave keep sending CWStackMode Above after "home"; honoring that
        put their windows on top of the shell. Only the foreground app may restack. */
     if (!fg) mask &= ~(CWSibling | CWStackMode);
-    if (fg && !window_is_trivial(e->window)) {
-      /* Cap at content height — fullscreen must not cover the gesture bar. */
-      wc.x = 0; wc.y = 0;
-      wc.width = W;
-      wc.height = app_normal_h();
-      mask |= CWX | CWY | CWWidth | CWHeight;
-      mask &= ~(CWSibling | CWStackMode);
-      raised_lane = 1;
+    if (a) {
+      int dx, dy, dw, dh;
+      /* Place even while covered, and even when the window is still 1x1 or
+         DirectColor. Otherwise SDL/Qt keep the centered placeholder. */
+      if (window_target_geom(a, e->window, &dx, &dy, &dw, &dh)) {
+        Window rr; int cx, cy; unsigned cw, ch, bd, dp;
+        int have = XGetGeometry(dpy, e->window, &rr, &cx, &cy, &cw, &ch, &bd, &dp);
+        if (have && cx == dx && cy == dy && (int)cw == dw && (int)ch == dh) {
+          /* Already placed. A client that keeps requesting another size must
+             get a ConfigureNotify of the size we keep, or it retries forever. */
+          int same = (!(e->value_mask & CWX) || e->x == dx)
+                  && (!(e->value_mask & CWY) || e->y == dy)
+                  && (!(e->value_mask & CWWidth) || e->width == dw)
+                  && (!(e->value_mask & CWHeight) || e->height == dh);
+          if (!same) {
+            XEvent ce;
+            memset(&ce, 0, sizeof ce);
+            ce.xconfigure.type = ConfigureNotify;
+            ce.xconfigure.display = dpy;
+            ce.xconfigure.event = e->window;
+            ce.xconfigure.window = e->window;
+            ce.xconfigure.x = dx;
+            ce.xconfigure.y = dy;
+            ce.xconfigure.width = dw;
+            ce.xconfigure.height = dh;
+            ce.xconfigure.border_width = 0;
+            ce.xconfigure.override_redirect = False;
+            XSendEvent(dpy, e->window, False, StructureNotifyMask, &ce);
+            return;
+          }
+        } else {
+          wc.x = dx; wc.y = dy; wc.width = dw; wc.height = dh;
+          mask |= CWX | CWY | CWWidth | CWHeight;
+          mask &= ~(CWSibling | CWStackMode);
+          raised_lane = 1;
+        }
+      }
     }
   }
 
@@ -5579,6 +6377,12 @@ static void on_destroy_notify(XDestroyWindowEvent *e) {
   }
   if (a->nwin > 0) return;
 
+  /* SDL (Tux Paint) destroys its first X window and creates another for the
+     DirectColor visual. The process is still the foreground app. Closing here
+     made the replacement MapRequest look unowned, so it stayed unmapped and
+     SDL blocked forever in XIfEvent(MapNotify). */
+  if (app_alive(a) && a->state != ST_CLOSED) return;
+
   /* last window of this app is gone: the app quit or crashed on its own */
   a->state = ST_CLOSED;
   snap_drop(a);
@@ -5619,10 +6423,105 @@ static int shell_size(int *ow, int *oh) {
   return 1;
 }
 
+/* The mode summerboard started in (the panel's preferred mode). Games such as
+   Half-Life switch the CRTC to 640x480; the X root stays 1366x768, so the
+   shell never notices, the panel scales that corner up, and the home swipe
+   is below the visible area. */
+static RROutput mode_output = None;
+static RRMode mode_native = None;
+static int mode_nw, mode_nh;
+static int randr_base = -1;
+static double mode_check_at;
+
+static void mode_remember(void) {
+  int err = 0;
+  if (!XRRQueryExtension(dpy, &randr_base, &err)) { randr_base = -1; return; }
+  XRRSelectInput(dpy, root, RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask | RROutputChangeNotifyMask);
+  XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+  if (!res) return;
+  RROutput pick = XRRGetOutputPrimary(dpy, root);
+  XRROutputInfo *oi = (pick != None) ? XRRGetOutputInfo(dpy, res, pick) : NULL;
+  if (!oi || oi->connection != RR_Connected || oi->nmode < 1) {
+    if (oi) XRRFreeOutputInfo(oi);
+    oi = NULL; pick = None;
+    for (int i = 0; i < res->noutput && !oi; i++) {
+      XRROutputInfo *t = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+      if (t && t->connection == RR_Connected && t->nmode > 0) { oi = t; pick = res->outputs[i]; }
+      else if (t) XRRFreeOutputInfo(t);
+    }
+  }
+  if (oi && pick != None) {
+    mode_output = pick;
+    mode_native = oi->modes[0];            /* preferred mode, the one xrandr marks '+' */
+    for (int m = 0; m < res->nmode; m++) {
+      if (res->modes[m].id == mode_native) {
+        mode_nw = res->modes[m].width;
+        mode_nh = res->modes[m].height;
+        break;
+      }
+    }
+    fprintf(stderr, "summerboard: native output mode %dx%d\n", mode_nw, mode_nh);
+  }
+  if (oi) XRRFreeOutputInfo(oi);
+  XRRFreeScreenResources(res);
+}
+
+/* 1 if this size is a game mode switch, not a rotation of the native mode. */
+static int mode_is_foreign(int nw, int nh) {
+  if (mode_nw < 64 || mode_nh < 64) return 0;
+  if ((nw == mode_nw && nh == mode_nh) || (nw == mode_nh && nh == mode_nw)) return 0;
+  return nw < mode_nw && nw < mode_nh && nh < mode_nw && nh < mode_nh;
+}
+
+static void mode_restore(void) {
+  if (mode_output == None || mode_native == None) return;
+  XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+  if (!res) return;
+  XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, mode_output);
+  if (!oi || oi->crtc == None) {
+    if (oi) XRRFreeOutputInfo(oi);
+    XRRFreeScreenResources(res);
+    return;
+  }
+  XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+  int cw = 0, ch = 0;
+  if (ci) {
+    for (int m = 0; m < res->nmode; m++) {
+      if (res->modes[m].id == ci->mode) { cw = res->modes[m].width; ch = res->modes[m].height; break; }
+    }
+  }
+  int foreign = ci && !((cw == mode_nw && ch == mode_nh) || (cw == mode_nh && ch == mode_nw));
+  if (foreign) {
+    int rot = ci->rotation;
+    int sw = mode_nw, sh = mode_nh;
+    if (rot & (RR_Rotate_90 | RR_Rotate_270)) { sw = mode_nh; sh = mode_nw; }
+    int rw = 0, rh = 0;
+    if (!root_size(&rw, &rh) || rw < sw || rh < sh)
+      XRRSetScreenSize(dpy, root, sw, sh, oi->mm_width > 0 ? oi->mm_width : sw, oi->mm_height > 0 ? oi->mm_height : sh);
+    fprintf(stderr, "summerboard: panel was %dx%d, restoring %dx%d\n", cw, ch, mode_nw, mode_nh);
+    XRRSetCrtcConfig(dpy, res, oi->crtc, CurrentTime, 0, 0, mode_native, rot, &mode_output, 1);
+  }
+  if (ci) XRRFreeCrtcInfo(ci);
+  XRRFreeOutputInfo(oi);
+  XRRFreeScreenResources(res);
+}
+
+static void mode_restore_throttled(void) {
+  double t = now_ms();
+  if (t < mode_check_at) return;
+  mode_check_at = t + 250.0;
+  mode_restore();
+}
+
 /* The root window changed size (RandR rotation). Everything sized to the old screen is rebuilt.
    force=1 also runs when W/H already match but the shell X window does not. */
 static void screen_resized_ex(int nw, int nh, int force) {
   if (nw <= 0 || nh <= 0) return;
+  if (mode_is_foreign(nw, nh)) {
+    fprintf(stderr, "summerboard: ignoring game mode %dx%d\n", nw, nh);
+    mode_restore();
+    return;
+  }
   int eff_h = shell_band_h_for(nh);
   int sw = 0, sh = 0, shell_ok = shell_size(&sw, &sh) && sw == nw && sh == eff_h;
   if (!force && nw == W && nh == H && shell_ok) return;
@@ -5683,8 +6582,10 @@ static void screen_resized(int nw, int nh) { screen_resized_ex(nw, nh, 0); }
 
 /* Poll live root geometry (XGetGeometry), never DisplayWidth/Height after RandR. */
 static int screen_size_poll(void) {
+  mode_restore_throttled();
   int nw = 0, nh = 0;
   if (!root_size(&nw, &nh)) return 0;
+  if (mode_is_foreign(nw, nh)) { mode_restore(); return 0; }
   if (nw != W || nh != H) {
     screen_resized_ex(nw, nh, 0);
     return 1;
@@ -5739,7 +6640,7 @@ int main(int argc, char **argv) {
   /* The same in both orientations, so rotating never changes the font and icon scale. */
   UI = fmax(1.0, fmin((double)fmax(W, H) / 1024.0, (double)fmin(W, H) / 768.0));
 
-  XSetWindowAttributes wa = { .event_mask = StructureNotifyMask | SubstructureRedirectMask | SubstructureNotifyMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask };
+  XSetWindowAttributes wa = { .event_mask = StructureNotifyMask | SubstructureRedirectMask | SubstructureNotifyMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | ColormapChangeMask };
   XChangeWindowAttributes(dpy, root, CWEventMask, &wa);
 
   /* Alpine has no cursor theme, so the server draws the built-in X cursor whenever a window
@@ -5760,8 +6661,19 @@ int main(int argc, char **argv) {
 
   XSync(dpy, False);                     /* surfaces BadAccess if another WM is running */
   XSetErrorHandler(wm_error_handler);
+  mode_remember();                       /* panel mode to put back when a game switches to 640x480 */
+  mode_restore();
   ewmh_init();                           /* advertise FULLSCREEN so clients use EWMH, not only OR */
   gesture_lane_ensure();                 /* home-gesture hit target above any FS client */
+  /* A finger slides ~15px. Krita's tool buttons are ~20px, so the release
+     misses the icon and the tool never selects. Hold the touch still until
+     it is clearly a drag, then follow it so drawing still works. */
+  if (fork() == 0) {
+    char tap[512];
+    summerboard_helper(tap, sizeof tap, "touch-tap");
+    execl(tap, "touch-tap", (char *)NULL);
+    _exit(0);
+  }
 
   if (!gl_init(&shell)) {
     fprintf(stderr, "summerboard: OpenGL initialisation failed (is Mesa / GLX available?)\n");
@@ -5808,6 +6720,12 @@ int main(int argc, char **argv) {
     while (XPending(dpy)) {
       XEvent ev;
       XNextEvent(dpy, &ev);
+      if (randr_base >= 0 && (ev.type == randr_base + RRScreenChangeNotify || ev.type == randr_base + RRNotify)) {
+        XRRUpdateConfiguration(&ev);
+        mode_restore();
+        dirty = 1;
+        continue;
+      }
       switch (ev.type) {
         case ConfigureNotify:
           if (ev.xconfigure.window == root || ev.xconfigure.window == shell) {
@@ -5821,13 +6739,17 @@ int main(int argc, char **argv) {
         case ConfigureRequest: on_configure_request(&ev.xconfigurerequest); break;
         case ClientMessage: on_client_message(&ev.xclient); dirty = 1; break;
         case PropertyNotify: on_property_notify(&ev.xproperty); break;
+        case ColormapNotify: colormap_guard(); dirty = 1; break;
         case UnmapNotify: on_unmap_notify(&ev.xunmap); dirty = 1; break;
         case DestroyNotify: on_destroy_notify(&ev.xdestroywindow); dirty = 1; break;
         case Expose: dirty = 1; break;
         case ButtonPress:
           if (!on_pointer_down(ev.xbutton.x_root, ev.xbutton.y_root)) {
+            game_forward_button(&ev.xbutton);
+            game_ptr_fwd = 1;
             XAllowEvents(dpy, ReplayPointer, CurrentTime);
           } else {
+            game_ptr_fwd = 0;
             XAllowEvents(dpy, AsyncPointer, CurrentTime);
           }
           dirty = 1;
@@ -5842,6 +6764,8 @@ int main(int argc, char **argv) {
           }
           settings_key(&ev.xkey); dirty = 1; break;
         case ButtonRelease:
+          if (game_ptr_fwd) game_forward_button(&ev.xbutton);
+          game_ptr_fwd = 0;
           on_pointer_up(ev.xbutton.x_root, ev.xbutton.y_root);
           XAllowEvents(dpy, AsyncPointer, CurrentTime);
           dirty = 1;
@@ -5850,6 +6774,7 @@ int main(int argc, char **argv) {
     }
     /* After MapRequest handling: Brave often remaps in the same burst we just drained. */
     home_enforce_stacking();
+    colormap_guard();
 
     int geom_wait = geom_flush_pending();   /* deliver the final throttled size */
     /* Background browsers keep remapping; wake periodically to re-hide them. */
